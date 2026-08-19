@@ -1,0 +1,18 @@
+{
+  "name": "TinyGiant",
+  "role": "Local inference engine (Qwen3-30B-A3B, 5+ tok/s on Apple Silicon)",
+  "adapterType": "http",
+  "adapterConfig": {
+    "url": "http://localhost:8000/v1/paperclip",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "timeoutMs": 120000,
+    "payloadTemplate": {
+      "prompt": "{{renderedPrompt}}",
+      "max_tokens": 512,
+      "temperature": 0.7
+    }
+  }
+}

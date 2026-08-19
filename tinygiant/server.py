@@ -69,8 +69,10 @@ _TAG_RE = re.compile(r"<\|im_(?:start|end)\|>")
 def _clean_output(text):
     """Strip thinking blocks and chat template tags from model output."""
     text = _THINK_RE.sub("", text)
+    # Handle incomplete thinking blocks (model ran out of tokens mid-think)
+    if "<think>" in text:
+        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
     text = _TAG_RE.sub("", text)
-    # Clean up residual role headers from spurious turns
     text = re.sub(r"\n*assistant\n*", "", text)
     return text.strip()
 
@@ -110,8 +112,55 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             self._handle_chat()
+        elif self.path == "/v1/paperclip":
+            self._handle_paperclip()
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _handle_paperclip(self):
+        body = self._read_body()
+
+        prompt_text = body.get("prompt", "")
+        if not prompt_text:
+            self._send_json(400, {"status": "error",
+                                  "result": "prompt is required"})
+            return
+
+        temperature = body.get("temperature", 0.7)
+        max_tokens = body.get("max_tokens", 512)
+        top_p = body.get("top_p", 0.9)
+
+        messages = [{"role": "user", "content": prompt_text}]
+        prompt = _format_chat(messages)
+        tokens = _tokenize(prompt)
+
+        _engine.reset_kv()
+
+        generated = []
+        finish_reason = "length"
+        for token_id in _engine.generate_stream(tokens, n_tokens=max_tokens,
+                                                 temperature=temperature,
+                                                 top_p=top_p):
+            if token_id in STOP_TOKENS:
+                finish_reason = "stop"
+                break
+            generated.append(token_id)
+
+        raw_text = _detokenize(generated)
+        text = _clean_output(raw_text)
+
+        run_id = body.get("runId", "")
+        print(f"[paperclip] run={run_id} {len(generated)} tokens, "
+              f"reason={finish_reason}")
+
+        self._send_json(200, {
+            "status": "completed",
+            "result": text,
+            "usage": {
+                "inputTokens": len(tokens),
+                "outputTokens": len(generated),
+            },
+        })
 
     def _handle_chat(self):
         body = self._read_body()
@@ -341,7 +390,8 @@ def cmd_serve():
     print(f"\nTinyGiant API server running on http://{args.host}:{args.port}")
     print(f"  Model: {_model_name}")
     print(f"  Endpoints:")
-    print(f"    POST /v1/chat/completions")
+    print(f"    POST /v1/chat/completions  (OpenAI-compatible)")
+    print(f"    POST /v1/paperclip         (Paperclip webhook)")
     print(f"    GET  /v1/models")
     print(f"    GET  /health")
     print(f"\nTest with:")

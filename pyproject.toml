@@ -21,6 +21,7 @@ tokenizer = ["llama-cpp-python>=0.2"]
 tinygiant = "tinygiant.cli:cmd_generate"
 tinygiant-relayout = "tinygiant.cli:cmd_relayout"
 tinygiant-setup = "tinygiant.cli:cmd_setup"
+tinygiant-server = "tinygiant.server:cmd_serve"
 
 [tool.setuptools.packages.find]
 include = ["tinygiant*"]

@@ -374,3 +374,36 @@ class NWSEngine:
                   f"({ec.pinned_hits} pinned-region accesses)")
 
         return generated
+
+    def generate_stream(self, prompt_tokens, n_tokens=128, temperature=0.7, top_p=0.9):
+        """Generate tokens one at a time, yielding each as it's produced."""
+        # Prefill
+        for i, tok in enumerate(prompt_tokens):
+            if i < len(prompt_tokens) - 1:
+                self.forward_one_token(tok, i)
+            else:
+                logits = self.forward_one_token(tok, i)
+
+        # Decode
+        for step in range(n_tokens):
+            pos = len(prompt_tokens) + step
+
+            if step == 0:
+                next_logits = logits
+            else:
+                next_logits = self.forward_one_token(next_token, pos - 1)
+
+            if temperature > 0:
+                probs = np.exp((next_logits - np.max(next_logits)) / temperature)
+                probs /= np.sum(probs)
+                sorted_idx = np.argsort(probs)[::-1]
+                cumsum = np.cumsum(probs[sorted_idx])
+                cutoff = np.searchsorted(cumsum, top_p) + 1
+                candidates = sorted_idx[:cutoff]
+                candidate_probs = probs[candidates]
+                candidate_probs /= np.sum(candidate_probs)
+                next_token = int(np.random.choice(candidates, p=candidate_probs))
+            else:
+                next_token = int(np.argmax(next_logits))
+
+            yield next_token

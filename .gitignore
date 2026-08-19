@@ -3,3 +3,14 @@ __pycache__/
 *.gguf
 *.json
 .DS_Store
+
+# Build artifacts
+*.dylib
+*.so
+*.o
+test_libtinygiant
+dist/
+*.egg-info/
+
+# Expert cache data
+*.bin

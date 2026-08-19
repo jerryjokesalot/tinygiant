@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinygiant"
+version = "0.1.0"
+description = "MoE inference on consumer hardware"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "gguf>=0.6",
+]
+
+[project.optional-dependencies]
+tokenizer = ["llama-cpp-python>=0.2"]
+
+[project.scripts]
+tinygiant = "tinygiant.cli:cmd_generate"
+tinygiant-relayout = "tinygiant.cli:cmd_relayout"
+tinygiant-setup = "tinygiant.cli:cmd_setup"
+
+[tool.setuptools.packages.find]
+include = ["tinygiant*"]
+
+[tool.setuptools.package-data]
+tinygiant = ["*.dylib", "*.so"]

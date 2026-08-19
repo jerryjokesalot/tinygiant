@@ -1,12 +1,72 @@
-# Cognitive Cascade: Real Hardware Validation
+# TinyGiant: Real Hardware Validation
 
-**Hardware:** Apple M1 MacBook Pro, 16GB unified memory, 500GB SSD
-**Date:** 2026-08-15
-**Status:** Spike complete — feasibility validated with real measurements
+**Hardware:** Apple M1 MacBook Air / Pro, 16GB unified memory, NVMe SSD
+**Dates:** 2026-08-15 (prototype), 2026-08-18-19 (compiled benchmarks)
+**Status:** End-to-end inference validated with real compute; pipelined I/O benchmarked
 
 ---
 
-## What We Measured
+## Compiled C Benchmarks (2026-08-18-19)
+
+### Expert-Contiguous Re-Layout
+
+GGUF stores all 128 experts interleaved in one tensor. Loading 1 expert page-faults all 6,912 pages (111x amplification). The re-layout tool repacks experts contiguously: 1 expert = 192 pages.
+
+| Metric | Interleaved (GGUF) | Contiguous (re-laid) |
+|--------|-------------------|---------------------|
+| Pages touched (1 expert) | 6,912 | 192 |
+| Pages touched (8 experts) | 6,912 | 1,536 |
+| Page fault reduction | -- | 36x |
+
+### Pipelined I/O Benchmark (nws_pipeline_bench.c)
+
+Compiled C, Apple Accelerate BLAS (sgemv), dedicated I/O thread with async pread.
+Model: Qwen3-30B-A3B, 48 layers, 128 experts (8 active), f16 expert cache.
+
+| Cache Hit Rate | Sequential | Pipelined | Speedup |
+|----------------|-----------|-----------|---------|
+| 0% | 1.53 tok/s | 1.43 tok/s | -- |
+| 50% | 2.20 tok/s | 2.40 tok/s | 1.09x |
+| 62% | 2.50 tok/s | 2.99 tok/s | 1.20x |
+| 75% | 2.92 tok/s | 3.81 tok/s | 1.30x |
+| 88% | 3.47 tok/s | 4.10 tok/s | 1.18x |
+| 100% | 4.46 tok/s | 4.45 tok/s | -- |
+
+### Component Costs (nws_moe_bench.c)
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Compute ceiling | 4.4 tok/s | f16→f32 + Accelerate sgemv, all in RAM |
+| MoE compute/layer | 2.1 ms | 8 experts, gate/up/down + SiLU (f32) |
+| MoE with f16 convert | 4.7 ms/layer | Includes f16→f32 conversion |
+| Attention/layer | 1.1 ms | Q/K/V/O projections |
+| SSD cold read | 2.9 ms/expert | 9 MB f16, F_NOCACHE |
+| SSD warm read | 1.1 ms/expert | OS page cache |
+| SSD throughput | 3.0+ GB/s | Sequential from contiguous layout |
+
+### Text-Calibrated Pinning
+
+| Strategy | Hit Rate |
+|----------|----------|
+| Random activation profile | 6% (= random chance) |
+| Text-calibrated (10 token pass) | 42% |
+| Oracle top-8/layer | 45% |
+| Calibrated + LRU (640 slots) | 56% |
+| Oracle top-32/layer | 88% |
+
+### Q4 Projection
+
+With Q4_K_M experts (~2.2 MB), I/O per expert drops to ~0.27 ms vs 4.7 ms compute/layer. Pipelining hides all misses at any cache hit rate. 32 pinned/layer × 48 layers = 3.4 GB for 88% oracle hit. (Projected from measured SSD throughput, not directly benchmarked.)
+
+### End-to-End Inference (nws_e2e_inference.py)
+
+Pure Python/numpy inference generating coherent text from the 30B model using the contiguous cache. Verified correct output. 0.34 tok/s (Python overhead; C benchmark shows 4.4 tok/s ceiling).
+
+---
+
+## Prototype Measurements (2026-08-15)
+
+### What We Measured
 
 ### Draft Model (Qwen2.5 1.5B, Q4_K_M, 1.0 GB)
 

@@ -112,6 +112,45 @@ class ExpertCache:
         self.access_counts = {}
         return count
 
+    def pin_nonuniform(self, pins_per_layer, n_layers):
+        """Pin a variable number of experts per layer.
+
+        pins_per_layer: dict mapping layer_idx -> n_experts to pin
+        Uses calibration data first, fills from static profile.
+        """
+        per_layer = {}
+        for (layer, expert), cnt in self.access_counts.items():
+            per_layer.setdefault(layer, []).append((-cnt, expert))
+        profile = self.index.get("activation_profile", {})
+
+        count = 0
+        for layer in range(n_layers):
+            n_pin = pins_per_layer.get(layer, 0)
+            if n_pin <= 0:
+                continue
+            pinned_this_layer = set()
+
+            entries = sorted(per_layer.get(layer, []))
+            for _, exp_id in entries[:n_pin]:
+                self._lock_expert(layer, exp_id)
+                pinned_this_layer.add(exp_id)
+                count += 1
+
+            remaining = n_pin - len(pinned_this_layer)
+            if remaining > 0 and str(layer) in profile:
+                for exp_id in profile[str(layer)]["expert_ranking"]:
+                    if exp_id not in pinned_this_layer:
+                        self._lock_expert(layer, exp_id)
+                        pinned_this_layer.add(exp_id)
+                        count += 1
+                        remaining -= 1
+                        if remaining <= 0:
+                            break
+
+        self.hits = self.misses = self.pinned_hits = 0
+        self.access_counts = {}
+        return count
+
     def get(self, layer_idx, expert_id):
         key = (layer_idx, expert_id)
         self.access_counts[key] = self.access_counts.get(key, 0) + 1

@@ -276,15 +276,38 @@ def cmd_serve():
     parser = argparse.ArgumentParser(
         prog="tinygiant-server",
         description="TinyGiant OpenAI-compatible API server")
-    parser.add_argument("--model", required=True, help="Path to GGUF model")
-    parser.add_argument("--cache", required=True, help="Path to NWS expert cache")
+    parser.add_argument("--model", help="Path to GGUF model")
+    parser.add_argument("--cache", help="Path to NWS expert cache")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
     parser.add_argument("--pin", type=int, default=48, help="Pin experts/layer (default: 48)")
     parser.add_argument("--calibrate", type=int, default=10, help="Calibration tokens")
     parser.add_argument("--model-name", default="tinygiant-qwen3-30b",
                         help="Model name in API responses")
+    parser.add_argument("--config", help="Path to JSON config file")
     args = parser.parse_args()
+
+    # Load config file if provided (CLI args override)
+    if args.config:
+        with open(os.path.expanduser(args.config)) as f:
+            cfg = json.load(f)
+        if not args.model:
+            args.model = cfg.get("model")
+        if not args.cache:
+            args.cache = cfg.get("cache")
+        if args.host == "0.0.0.0" and "host" in cfg:
+            args.host = cfg["host"]
+        if args.port == 8000 and "port" in cfg:
+            args.port = cfg["port"]
+        if args.pin == 48 and "pin" in cfg:
+            args.pin = cfg["pin"]
+        if args.calibrate == 10 and "calibrate" in cfg:
+            args.calibrate = cfg["calibrate"]
+        if args.model_name == "tinygiant-qwen3-30b" and "model_name" in cfg:
+            args.model_name = cfg["model_name"]
+
+    if not args.model or not args.cache:
+        parser.error("--model and --cache are required (via CLI or --config)")
 
     model_path = os.path.expanduser(args.model)
     cache_dir = os.path.expanduser(args.cache)
@@ -332,3 +355,7 @@ def cmd_serve():
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.shutdown()
+
+
+if __name__ == "__main__":
+    cmd_serve()

@@ -11,10 +11,12 @@ from ._constants import EXPERT_KEYS_ORDER
 class ExpertCache:
     """mmap-based expert cache. OS handles page caching at kernel speed."""
 
-    def __init__(self, cache_dir, index, max_experts=256):
+    def __init__(self, cache_dir, index, max_experts=256,
+                 layer_start=0, layer_end=48):
         self.cache_dir = Path(cache_dir)
-        self.index = index
         self.max_experts = max_experts
+        self.layer_start = layer_start
+        self.layer_end = layer_end
         self.hits = 0
         self.misses = 0
         self.pinned_hits = 0
@@ -26,6 +28,18 @@ class ExpertCache:
         self._mmaps = {}
         self._fds = {}
         self._expert_views = {}
+
+        # Filter index to only include layers in [layer_start, layer_end)
+        self.index = dict(index)
+        self.index["layers"] = {
+            k: v for k, v in index["layers"].items()
+            if layer_start <= int(k) < layer_end
+        }
+        if "activation_profile" in index:
+            self.index["activation_profile"] = {
+                k: v for k, v in index.get("activation_profile", {}).items()
+                if layer_start <= int(k) < layer_end
+            }
 
         self._init_mmaps()
 

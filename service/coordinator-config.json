@@ -1,0 +1,11 @@
+{
+    "model": "~/models/qwen3-30b-a3b.gguf",
+    "cache": "~/.tinygiant/cache/coordinator",
+    "role": "coordinator",
+    "split_layer": 24,
+    "worker_host": "macbook-pro",
+    "worker_port": 9100,
+    "pin": 48,
+    "calibrate": 10,
+    "model_name": "tinygiant-qwen3-30b"
+}

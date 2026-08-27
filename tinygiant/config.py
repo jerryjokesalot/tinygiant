@@ -12,6 +12,11 @@ class TinyGiantConfig:
     max_tokens: int = 4096
     temperature: float = 0.7
     top_p: float = 0.9
+    role: str = "standalone"        # standalone, coordinator, worker
+    split_layer: int = 24
+    worker_host: str = "localhost"
+    worker_port: int = 9100
+    listen_port: int = 9100
 
     def __post_init__(self):
         if self.model_path:

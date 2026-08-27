@@ -171,6 +171,8 @@ class NWSEngine:
                 "k": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
                 "v": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
             }
+        if hasattr(self, '_worker') and self._worker and self._worker.connected:
+            self._worker.reset()
 
     def calibrate(self, prompt_tokens, n_tokens=10):
         for i, tok in enumerate(prompt_tokens):
@@ -206,9 +208,33 @@ class NWSEngine:
         print(f" {count} experts ({pin_gb:.1f} GB) in {time.perf_counter()-t0:.1f}s")
         return count
 
+    def set_worker(self, worker_conn):
+        self._worker = worker_conn
+
+    def _forward_distributed(self, x, pos):
+        """Run local layers, then delegate to remote worker for remaining layers."""
+        for i in range(self.layer_start, self.layer_end):
+            if self.is_q4 and self.tg_lib:
+                x = self._layer_forward(x, i, pos)
+            else:
+                x = self._layer_forward_numpy(x, i, pos)
+        x = self._worker.forward(x, pos)
+        self.kv_len = pos + 1
+        if self.tg_lib:
+            out = np.empty(EMBED_DIM, dtype=np.float32)
+            self.tg_lib.tg_rms_norm(
+                x.ctypes.data, self.output_norm.ctypes.data,
+                out.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
+            return self.output_weight @ out
+        else:
+            x = rms_norm(x, self.output_norm)
+            return self.output_weight @ x
+
     def forward_one_token(self, token_id, pos):
         x = np.ascontiguousarray(self.token_embd[token_id].copy(), dtype=np.float32)
-        if self.is_q4 and self.tg_lib:
+        if hasattr(self, '_worker') and self._worker and self._worker.connected:
+            return self._forward_distributed(x, pos)
+        elif self.is_q4 and self.tg_lib:
             return self._forward_c(x, pos)
         else:
             return self._forward_numpy(x, pos)

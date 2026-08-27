@@ -337,6 +337,7 @@ def cmd_serve():
     args = parser.parse_args()
 
     # Load config file if provided (CLI args override)
+    cfg = {}
     if args.config:
         with open(os.path.expanduser(args.config)) as f:
             cfg = json.load(f)
@@ -384,6 +385,30 @@ def cmd_serve():
     cal_tokens = _tokenize(cal_prompt)
     _engine.pin_experts(args.pin, calibrate_tokens=args.calibrate,
                         prompt_tokens=cal_tokens)
+
+    # Connect to worker if coordinator mode
+    if cfg.get("role") == "coordinator":
+        from .distributed import WorkerConnection
+        import time as _time
+        worker_host = cfg.get("worker_host", "localhost")
+        worker_port = cfg.get("worker_port", 9100)
+        print(f"\nConnecting to worker at {worker_host}:{worker_port}...")
+        wc = WorkerConnection()
+        retries = 0
+        while retries < 12:
+            try:
+                wc.connect(worker_host, worker_port)
+                print("Worker connected!")
+                break
+            except (ConnectionRefusedError, OSError) as e:
+                retries += 1
+                print(f"  retry {retries}/12: {e}")
+                _time.sleep(5)
+        else:
+            print("WARNING: Could not connect to worker. Running in degraded mode.")
+            wc = None
+        if wc:
+            _engine.set_worker(wc)
 
     # Start server
     server = HTTPServer((args.host, args.port), Handler)

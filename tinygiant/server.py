@@ -31,6 +31,7 @@ STOP_TOKENS = set()
 _engine = None
 _tokenizer = None
 _model_name = "tinygiant-qwen3-30b"
+_degraded = False
 
 
 def _init_tokenizer(model_path):
@@ -105,7 +106,11 @@ class Handler(BaseHTTPRequestHandler):
                 }]
             })
         elif self.path == "/health":
-            self._send_json(200, {"status": "ok", "model": _model_name})
+            self._send_json(200, {
+                "status": "ok" if not _degraded else "degraded",
+                "model": _model_name,
+                "distributed": not _degraded,
+            })
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -118,6 +123,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def _handle_paperclip(self):
+        global _degraded
+        if _degraded:
+            self._send_json(503, {"error": {"message": "Worker unavailable — distributed inference degraded"}})
+            return
+
         body = self._read_body()
 
         prompt_text = body.get("prompt", "")
@@ -136,15 +146,20 @@ class Handler(BaseHTTPRequestHandler):
 
         _engine.reset_kv()
 
-        generated = []
-        finish_reason = "length"
-        for token_id in _engine.generate_stream(tokens, n_tokens=max_tokens,
-                                                 temperature=temperature,
-                                                 top_p=top_p):
-            if token_id in STOP_TOKENS:
-                finish_reason = "stop"
-                break
-            generated.append(token_id)
+        try:
+            generated = []
+            finish_reason = "length"
+            for token_id in _engine.generate_stream(tokens, n_tokens=max_tokens,
+                                                     temperature=temperature,
+                                                     top_p=top_p):
+                if token_id in STOP_TOKENS:
+                    finish_reason = "stop"
+                    break
+                generated.append(token_id)
+        except (ConnectionError, OSError):
+            _degraded = True
+            self._send_json(503, {"error": {"message": "Worker connection lost"}})
+            return
 
         raw_text = _detokenize(generated)
         text = _clean_output(raw_text)
@@ -163,6 +178,11 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_chat(self):
+        global _degraded
+        if _degraded:
+            self._send_json(503, {"error": {"message": "Worker unavailable — distributed inference degraded"}})
+            return
+
         body = self._read_body()
 
         messages = body.get("messages", [])
@@ -182,12 +202,16 @@ class Handler(BaseHTTPRequestHandler):
 
         _engine.reset_kv()
 
-        if stream:
-            self._stream_response(tokens, request_id, created,
-                                  temperature, max_tokens, top_p)
-        else:
-            self._full_response(tokens, request_id, created,
-                                temperature, max_tokens, top_p)
+        try:
+            if stream:
+                self._stream_response(tokens, request_id, created,
+                                      temperature, max_tokens, top_p)
+            else:
+                self._full_response(tokens, request_id, created,
+                                    temperature, max_tokens, top_p)
+        except (ConnectionError, OSError):
+            _degraded = True
+            self._send_json(503, {"error": {"message": "Worker connection lost"}})
 
     def _stream_response(self, tokens, request_id, created,
                          temperature, max_tokens, top_p):
@@ -337,6 +361,7 @@ def cmd_serve():
     args = parser.parse_args()
 
     # Load config file if provided (CLI args override)
+    cfg = {}
     if args.config:
         with open(os.path.expanduser(args.config)) as f:
             cfg = json.load(f)
@@ -362,11 +387,18 @@ def cmd_serve():
     cache_dir = os.path.expanduser(args.cache)
     _model_name = args.model_name
 
-    # Validate cache
+    # Determine layer range — coordinator only loads its half
+    role = cfg.get("role", "standalone")
+    layer_start = 0
+    layer_end = N_LAYERS
+    if role == "coordinator":
+        layer_end = cfg.get("split_layer", 24)
+
+    # Validate cache for the layers this process will use
     with open(os.path.join(cache_dir, "index.json")) as f:
         idx = json.load(f)
     cached_layers = sorted(int(k) for k in idx["layers"].keys())
-    missing = [i for i in range(N_LAYERS) if i not in cached_layers]
+    missing = [i for i in range(layer_start, layer_end) if i not in cached_layers]
     if missing:
         print(f"ERROR: Missing layers in cache: {missing}")
         sys.exit(1)
@@ -376,14 +408,40 @@ def cmd_serve():
     _tokenizer = _init_tokenizer(model_path)
     print(" done")
 
-    # Init engine
-    _engine = NWSEngine(model_path, cache_dir)
+    # Init engine with the appropriate layer range
+    _engine = NWSEngine(model_path, cache_dir, layer_start=layer_start, layer_end=layer_end)
 
     # Calibrate and pin
     cal_prompt = "The key insight about mixture-of-experts models is that"
     cal_tokens = _tokenize(cal_prompt)
     _engine.pin_experts(args.pin, calibrate_tokens=args.calibrate,
                         prompt_tokens=cal_tokens)
+
+    # Connect to worker if coordinator mode
+    if role == "coordinator":
+        from .distributed import WorkerConnection
+        worker_host = cfg.get("worker_host", "localhost")
+        worker_port = cfg.get("worker_port", 9100)
+        print(f"\nConnecting to worker at {worker_host}:{worker_port}...")
+        wc = WorkerConnection()
+        retries = 0
+        while retries < 12:
+            try:
+                wc.connect(worker_host, worker_port)
+                print("Worker connected!")
+                break
+            except (ConnectionRefusedError, OSError) as e:
+                retries += 1
+                print(f"  retry {retries}/12: {e}")
+                time.sleep(5)
+        else:
+            print("WARNING: Could not connect to worker. Running in degraded mode.")
+            wc = None
+        if wc:
+            _engine.set_worker(wc)
+        else:
+            global _degraded
+            _degraded = True
 
     # Start server
     server = HTTPServer((args.host, args.port), Handler)

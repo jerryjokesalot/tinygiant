@@ -1,0 +1,9 @@
+{
+    "model": "~/models/qwen3-30b-a3b.gguf",
+    "cache": "~/.tinygiant/cache/worker",
+    "role": "worker",
+    "split_layer": 24,
+    "listen_port": 9100,
+    "pin": 64,
+    "calibrate": 10
+}

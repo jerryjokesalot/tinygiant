@@ -22,9 +22,17 @@ def _dequant(tensor):
 
 class NWSEngine:
 
-    def __init__(self, model_path, cache_dir, lib_path=None):
+    def __init__(self, model_path, cache_dir, layer_start=0, layer_end=None,
+                 load_embeddings=True, load_output=True, lib_path=None):
         print("TinyGiant Inference Engine")
         print("=" * 60)
+
+        if layer_end is None:
+            layer_end = N_LAYERS
+        self.layer_start = layer_start
+        self.layer_end = layer_end
+        self.load_embeddings = load_embeddings
+        self.load_output = load_output
 
         t_start = time.perf_counter()
 
@@ -54,45 +62,54 @@ class NWSEngine:
                 self.is_q4 = False
 
         # Expert cache
-        self.expert_cache = ExpertCache(cache_dir, self.cache_index, max_experts=512)
+        self.expert_cache = ExpertCache(
+            cache_dir, self.cache_index, max_experts=512,
+            layer_start=layer_start, layer_end=layer_end,
+        )
         if self.tg_lib:
             self.expert_cache.set_lib(self.tg_lib)
 
         # Embeddings
-        print("Loading embeddings...", end="", flush=True)
-        t0 = time.perf_counter()
-        self.token_embd = _dequant(self.tensor_map["token_embd.weight"])
-        print(f" {time.perf_counter()-t0:.1f}s ({self.token_embd.nbytes/1024**2:.0f} MB)")
+        if load_embeddings:
+            print("Loading embeddings...", end="", flush=True)
+            t0 = time.perf_counter()
+            self.token_embd = _dequant(self.tensor_map["token_embd.weight"])
+            print(f" {time.perf_counter()-t0:.1f}s ({self.token_embd.nbytes/1024**2:.0f} MB)")
+        else:
+            print("Embeddings: skipped (load_embeddings=False)")
 
         # Output head
-        print("Loading output head...", end="", flush=True)
-        t0 = time.perf_counter()
-        self.output_weight = _dequant(self.tensor_map["output.weight"])
-        self.output_norm = _dequant(self.tensor_map["output_norm.weight"])
-        print(f" {time.perf_counter()-t0:.1f}s ({self.output_weight.nbytes/1024**2:.0f} MB)")
+        if load_output:
+            print("Loading output head...", end="", flush=True)
+            t0 = time.perf_counter()
+            self.output_weight = _dequant(self.tensor_map["output.weight"])
+            self.output_norm = _dequant(self.tensor_map["output_norm.weight"])
+            print(f" {time.perf_counter()-t0:.1f}s ({self.output_weight.nbytes/1024**2:.0f} MB)")
+        else:
+            print("Output head: skipped (load_output=False)")
 
         # Norms + routers
         print("Loading norms and routers...", end="", flush=True)
         t0 = time.perf_counter()
-        self.attn_norms = []
-        self.ffn_norms = []
-        self.routers = []
-        self.qk_norms = []
-        for i in range(N_LAYERS):
-            self.attn_norms.append(_dequant(self.tensor_map[f"blk.{i}.attn_norm.weight"]))
-            self.ffn_norms.append(_dequant(self.tensor_map[f"blk.{i}.ffn_norm.weight"]))
-            self.routers.append(_dequant(self.tensor_map[f"blk.{i}.ffn_gate_inp.weight"]))
+        self.attn_norms = {}
+        self.ffn_norms = {}
+        self.routers = {}
+        self.qk_norms = {}
+        for i in range(layer_start, layer_end):
+            self.attn_norms[i] = _dequant(self.tensor_map[f"blk.{i}.attn_norm.weight"])
+            self.ffn_norms[i] = _dequant(self.tensor_map[f"blk.{i}.ffn_norm.weight"])
+            self.routers[i] = _dequant(self.tensor_map[f"blk.{i}.ffn_gate_inp.weight"])
             q_norm = _dequant(self.tensor_map[f"blk.{i}.attn_q_norm.weight"])
             k_norm = _dequant(self.tensor_map[f"blk.{i}.attn_k_norm.weight"])
-            self.qk_norms.append((q_norm, k_norm))
+            self.qk_norms[i] = (q_norm, k_norm)
         print(f" {time.perf_counter()-t0:.1f}s")
 
         # Attention weights
         print("Loading attention weights...", end="", flush=True)
         t0 = time.perf_counter()
-        self.attn_weights = []
+        self.attn_weights = {}
         self.attn_q4 = self.is_q4 and self.tg_lib
-        for i in range(N_LAYERS):
+        for i in range(layer_start, layer_end):
             if self.attn_q4:
                 tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
                 tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
@@ -102,38 +119,42 @@ class NWSEngine:
                 wk_raw = tk.data.reshape(-1).view(np.uint8).copy()
                 wv_f16 = gguf_dequantize(tv.data, tv.tensor_type).astype(np.float16).copy()
                 wo_raw = to.data.reshape(-1).view(np.uint8).copy()
-                self.attn_weights.append({
+                self.attn_weights[i] = {
                     "q": wq_raw, "k": wk_raw, "v": wv_f16, "o": wo_raw,
-                })
+                }
             else:
-                self.attn_weights.append({
+                self.attn_weights[i] = {
                     "q": _dequant(self.tensor_map[f"blk.{i}.attn_q.weight"]),
                     "k": _dequant(self.tensor_map[f"blk.{i}.attn_k.weight"]),
                     "v": _dequant(self.tensor_map[f"blk.{i}.attn_v.weight"]),
                     "o": _dequant(self.tensor_map[f"blk.{i}.attn_output.weight"]),
-                })
-        attn_mb = sum(sum(w.nbytes for w in l.values()) for l in self.attn_weights) / 1024**2
+                }
+        attn_mb = sum(sum(w.nbytes for w in l.values()) for l in self.attn_weights.values()) / 1024**2
         print(f" {time.perf_counter()-t0:.1f}s ({attn_mb:.0f} MB)")
 
         # RoPE cache
         self.rope_cos, self.rope_sin = build_rope_cache(4096)
 
-        # KV cache
+        # KV cache — dicts keyed by layer index
         self.kv_max = 4096
         self.kv_len = 0
-        self.kv_k = [np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
-                      for _ in range(N_LAYERS)]
-        self.kv_v = [np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
-                      for _ in range(N_LAYERS)]
-        self.kv_cache = [
-            {"k": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
-             "v": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32)}
-            for _ in range(N_LAYERS)
-        ]
+        self.kv_k = {
+            i: np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
+            for i in range(layer_start, layer_end)
+        }
+        self.kv_v = {
+            i: np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
+            for i in range(layer_start, layer_end)
+        }
+        self.kv_cache = {
+            i: {"k": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
+                "v": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32)}
+            for i in range(layer_start, layer_end)
+        }
 
         # mlock attention weights
         if self.tg_lib:
-            for i in range(N_LAYERS):
+            for i in range(layer_start, layer_end):
                 for k, v in self.attn_weights[i].items():
                     self.tg_lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
             print(f"  Attention weights: mlock'd ({attn_mb:.0f} MB)")
@@ -143,13 +164,15 @@ class NWSEngine:
 
     def reset_kv(self):
         self.kv_len = 0
-        for i in range(N_LAYERS):
+        for i in range(self.layer_start, self.layer_end):
             self.kv_k[i][:] = 0
             self.kv_v[i][:] = 0
             self.kv_cache[i] = {
                 "k": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
                 "v": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
             }
+        if hasattr(self, '_worker') and self._worker and self._worker.connected:
+            self._worker.reset()
 
     def calibrate(self, prompt_tokens, n_tokens=10):
         for i, tok in enumerate(prompt_tokens):
@@ -185,134 +208,175 @@ class NWSEngine:
         print(f" {count} experts ({pin_gb:.1f} GB) in {time.perf_counter()-t0:.1f}s")
         return count
 
+    def set_worker(self, worker_conn):
+        self._worker = worker_conn
+
+    def _forward_distributed(self, x, pos):
+        """Run local layers, then delegate to remote worker for remaining layers."""
+        for i in range(self.layer_start, self.layer_end):
+            if self.is_q4 and self.tg_lib:
+                x = self._layer_forward(x, i, pos)
+            else:
+                x = self._layer_forward_numpy(x, i, pos)
+        try:
+            x = self._worker.forward(x, pos)
+        except (ConnectionError, OSError):
+            self._worker = None
+            raise
+        self.kv_len = pos + 1
+        if self.tg_lib:
+            out = np.empty(EMBED_DIM, dtype=np.float32)
+            self.tg_lib.tg_rms_norm(
+                x.ctypes.data, self.output_norm.ctypes.data,
+                out.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
+            return self.output_weight @ out
+        else:
+            x = rms_norm(x, self.output_norm)
+            return self.output_weight @ x
+
     def forward_one_token(self, token_id, pos):
         x = np.ascontiguousarray(self.token_embd[token_id].copy(), dtype=np.float32)
-        if self.is_q4 and self.tg_lib:
+        if hasattr(self, '_worker') and self._worker and self._worker.connected:
+            return self._forward_distributed(x, pos)
+        elif self.is_q4 and self.tg_lib:
             return self._forward_c(x, pos)
         else:
             return self._forward_numpy(x, pos)
 
-    def _forward_c(self, x, pos):
+    def _layer_forward(self, x, layer_idx, pos):
+        """Single-layer forward pass (C/Q4 path)."""
         lib = self.tg_lib
         ec = self.expert_cache
+        i = layer_idx
 
-        for i in range(N_LAYERS):
-            aw = self.attn_weights[i]
-            q_norm_w, k_norm_w = self.qk_norms[i]
+        aw = self.attn_weights[i]
+        q_norm_w, k_norm_w = self.qk_norms[i]
 
-            attn_out = np.empty(EMBED_DIM, dtype=np.float32)
-            normed = np.empty(EMBED_DIM, dtype=np.float32)
-            lib.tg_rms_norm(x.ctypes.data, self.attn_norms[i].ctypes.data,
-                            normed.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
-            if self.attn_q4:
-                lib.tg_attention_decode_q4(
-                    aw["q"].ctypes.data, aw["k"].ctypes.data,
-                    aw["v"].ctypes.data, aw["o"].ctypes.data,
-                    q_norm_w.ctypes.data, k_norm_w.ctypes.data,
-                    self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
-                    pos, self.kv_max,
-                    self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
-                    normed.ctypes.data, attn_out.ctypes.data,
-                    EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+        attn_out = np.empty(EMBED_DIM, dtype=np.float32)
+        normed = np.empty(EMBED_DIM, dtype=np.float32)
+        lib.tg_rms_norm(x.ctypes.data, self.attn_norms[i].ctypes.data,
+                        normed.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
+        if self.attn_q4:
+            lib.tg_attention_decode_q4(
+                aw["q"].ctypes.data, aw["k"].ctypes.data,
+                aw["v"].ctypes.data, aw["o"].ctypes.data,
+                q_norm_w.ctypes.data, k_norm_w.ctypes.data,
+                self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
+                pos, self.kv_max,
+                self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
+                normed.ctypes.data, attn_out.ctypes.data,
+                EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+        else:
+            lib.tg_attention_decode(
+                aw["q"].ctypes.data, aw["k"].ctypes.data,
+                aw["v"].ctypes.data, aw["o"].ctypes.data,
+                q_norm_w.ctypes.data, k_norm_w.ctypes.data,
+                self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
+                pos, self.kv_max,
+                self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
+                normed.ctypes.data, attn_out.ctypes.data,
+                EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+        x += attn_out
+
+        lib.tg_rms_norm(x.ctypes.data, self.ffn_norms[i].ctypes.data,
+                        normed.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
+        logits = self.routers[i] @ normed
+        top_k_idx = np.argsort(logits)[-N_EXPERTS_USED:]
+        top_k_logits = logits[top_k_idx]
+        exp_l = np.exp(top_k_logits - np.max(top_k_logits))
+        weights = np.ascontiguousarray(
+            (exp_l / np.sum(exp_l)).astype(np.float32))
+
+        experts = [ec.get(i, int(eid)) for eid in top_k_idx]
+
+        moe_out = np.zeros(EMBED_DIM, dtype=np.float32)
+        for j, expert in enumerate(experts):
+            fmt = expert.get("_formats", {}).get("down", "q4_k")
+            if fmt == "float16":
+                down_fmt = 1
+            elif fmt == "q6_k":
+                down_fmt = 2
             else:
-                lib.tg_attention_decode(
-                    aw["q"].ctypes.data, aw["k"].ctypes.data,
-                    aw["v"].ctypes.data, aw["o"].ctypes.data,
-                    q_norm_w.ctypes.data, k_norm_w.ctypes.data,
-                    self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
-                    pos, self.kv_max,
-                    self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
-                    normed.ctypes.data, attn_out.ctypes.data,
-                    EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
-            x += attn_out
+                down_fmt = 0
+            lib.tg_expert_forward_mixed(
+                expert["gate"].ctypes.data,
+                expert["up"].ctypes.data,
+                expert["down"].ctypes.data,
+                down_fmt,
+                normed.ctypes.data,
+                moe_out.ctypes.data,
+                ctypes.c_float(float(weights[j])),
+                EMBED_DIM, EXPERT_INTERMEDIATE)
+        x += moe_out
+        return x
 
-            lib.tg_rms_norm(x.ctypes.data, self.ffn_norms[i].ctypes.data,
-                            normed.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
-            logits = self.routers[i] @ normed
-            top_k_idx = np.argsort(logits)[-N_EXPERTS_USED:]
-            top_k_logits = logits[top_k_idx]
-            exp_l = np.exp(top_k_logits - np.max(top_k_logits))
-            weights = np.ascontiguousarray(
-                (exp_l / np.sum(exp_l)).astype(np.float32))
+    def _layer_forward_numpy(self, x, layer_idx, pos):
+        """Single-layer forward pass (numpy path)."""
+        i = layer_idx
+        aw = self.attn_weights[i]
 
-            experts = [ec.get(i, int(eid)) for eid in top_k_idx]
+        normed = rms_norm(x, self.attn_norms[i])
+        q = (aw["q"] @ normed).reshape(N_HEADS, HEAD_DIM)
+        k = (aw["k"] @ normed).reshape(N_KV_HEADS, HEAD_DIM)
+        v = (aw["v"] @ normed).reshape(N_KV_HEADS, HEAD_DIM)
+        q_norm_w, k_norm_w = self.qk_norms[i]
+        q = rms_norm(q, q_norm_w)
+        k = rms_norm(k, k_norm_w)
+        q = apply_rope(q, self.rope_cos, self.rope_sin, pos)
+        k = apply_rope(k, self.rope_cos, self.rope_sin, pos)
+        kv = self.kv_cache[i]
+        kv["k"] = np.concatenate([kv["k"], k[:, None, :]], axis=1)
+        kv["v"] = np.concatenate([kv["v"], v[:, None, :]], axis=1)
+        output = np.zeros(N_HEADS * HEAD_DIM, dtype=np.float32)
+        for h in range(N_HEADS):
+            kv_h = h // GQA_RATIO
+            q_h = q[h]
+            k_all = kv["k"][kv_h]
+            v_all = kv["v"][kv_h]
+            scores = (k_all @ q_h) / np.sqrt(HEAD_DIM)
+            scores_max = np.max(scores)
+            exp_scores = np.exp(scores - scores_max)
+            attn_w = exp_scores / np.sum(exp_scores)
+            output[h * HEAD_DIM:(h + 1) * HEAD_DIM] = attn_w @ v_all
+        x = x + aw["o"] @ output
 
-            moe_out = np.zeros(EMBED_DIM, dtype=np.float32)
-            for j, expert in enumerate(experts):
-                fmt = expert.get("_formats", {}).get("down", "q4_k")
-                if fmt == "float16":
-                    down_fmt = 1
-                elif fmt == "q6_k":
-                    down_fmt = 2
-                else:
-                    down_fmt = 0
-                lib.tg_expert_forward_mixed(
-                    expert["gate"].ctypes.data,
-                    expert["up"].ctypes.data,
-                    expert["down"].ctypes.data,
-                    down_fmt,
-                    normed.ctypes.data,
-                    moe_out.ctypes.data,
-                    ctypes.c_float(float(weights[j])),
-                    EMBED_DIM, EXPERT_INTERMEDIATE)
-            x += moe_out
+        normed = rms_norm(x, self.ffn_norms[i])
+        logits = self.routers[i] @ normed
+        top_k_idx = np.argsort(logits)[-N_EXPERTS_USED:]
+        top_k_logits = logits[top_k_idx]
+        exp_l = np.exp(top_k_logits - np.max(top_k_logits))
+        weights = exp_l / np.sum(exp_l)
+        moe_out = np.zeros(EMBED_DIM, dtype=np.float32)
+        for j, exp_id in enumerate(top_k_idx):
+            expert = self.expert_cache.get(i, int(exp_id))
+            gate_out = expert["gate"].astype(np.float32) @ normed
+            up_out = expert["up"].astype(np.float32) @ normed
+            silu = gate_out / (1 + np.exp(-np.clip(gate_out, -20, 20)))
+            hidden = silu * up_out
+            exp_out = expert["down"].astype(np.float32) @ hidden
+            moe_out += weights[j] * exp_out
+        x = x + moe_out
+        return x
 
+    def _forward_c(self, x, pos):
+        for i in range(self.layer_start, self.layer_end):
+            x = self._layer_forward(x, i, pos)
         self.kv_len = pos + 1
-
-        out = np.empty(EMBED_DIM, dtype=np.float32)
-        lib.tg_rms_norm(x.ctypes.data, self.output_norm.ctypes.data,
-                        out.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
-        logits = self.output_weight @ out
-        return logits
+        if self.load_output:
+            lib = self.tg_lib
+            out = np.empty(EMBED_DIM, dtype=np.float32)
+            lib.tg_rms_norm(x.ctypes.data, self.output_norm.ctypes.data,
+                            out.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
+            return self.output_weight @ out
+        return x
 
     def _forward_numpy(self, x, pos):
-        for i in range(N_LAYERS):
-            aw = self.attn_weights[i]
-
-            normed = rms_norm(x, self.attn_norms[i])
-            q = (aw["q"] @ normed).reshape(N_HEADS, HEAD_DIM)
-            k = (aw["k"] @ normed).reshape(N_KV_HEADS, HEAD_DIM)
-            v = (aw["v"] @ normed).reshape(N_KV_HEADS, HEAD_DIM)
-            q_norm_w, k_norm_w = self.qk_norms[i]
-            q = rms_norm(q, q_norm_w)
-            k = rms_norm(k, k_norm_w)
-            q = apply_rope(q, self.rope_cos, self.rope_sin, pos)
-            k = apply_rope(k, self.rope_cos, self.rope_sin, pos)
-            kv = self.kv_cache[i]
-            kv["k"] = np.concatenate([kv["k"], k[:, None, :]], axis=1)
-            kv["v"] = np.concatenate([kv["v"], v[:, None, :]], axis=1)
-            output = np.zeros(N_HEADS * HEAD_DIM, dtype=np.float32)
-            for h in range(N_HEADS):
-                kv_h = h // GQA_RATIO
-                q_h = q[h]
-                k_all = kv["k"][kv_h]
-                v_all = kv["v"][kv_h]
-                scores = (k_all @ q_h) / np.sqrt(HEAD_DIM)
-                scores_max = np.max(scores)
-                exp_scores = np.exp(scores - scores_max)
-                attn_w = exp_scores / np.sum(exp_scores)
-                output[h * HEAD_DIM:(h + 1) * HEAD_DIM] = attn_w @ v_all
-            x = x + aw["o"] @ output
-
-            normed = rms_norm(x, self.ffn_norms[i])
-            logits = self.routers[i] @ normed
-            top_k_idx = np.argsort(logits)[-N_EXPERTS_USED:]
-            top_k_logits = logits[top_k_idx]
-            exp_l = np.exp(top_k_logits - np.max(top_k_logits))
-            weights = exp_l / np.sum(exp_l)
-            moe_out = np.zeros(EMBED_DIM, dtype=np.float32)
-            for j, exp_id in enumerate(top_k_idx):
-                expert = self.expert_cache.get(i, int(exp_id))
-                gate_out = expert["gate"].astype(np.float32) @ normed
-                up_out = expert["up"].astype(np.float32) @ normed
-                silu = gate_out / (1 + np.exp(-np.clip(gate_out, -20, 20)))
-                hidden = silu * up_out
-                exp_out = expert["down"].astype(np.float32) @ hidden
-                moe_out += weights[j] * exp_out
-            x = x + moe_out
-
-        x = rms_norm(x, self.output_norm)
-        return self.output_weight @ x
+        for i in range(self.layer_start, self.layer_end):
+            x = self._layer_forward_numpy(x, i, pos)
+        if self.load_output:
+            x = rms_norm(x, self.output_norm)
+            return self.output_weight @ x
+        return x
 
     def generate(self, prompt_tokens, n_tokens=10, temperature=0.7, top_p=0.9):
         print(f"\nGenerating {n_tokens} tokens from {len(prompt_tokens)}-token prompt")

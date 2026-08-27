@@ -363,11 +363,18 @@ def cmd_serve():
     cache_dir = os.path.expanduser(args.cache)
     _model_name = args.model_name
 
-    # Validate cache
+    # Determine layer range — coordinator only loads its half
+    role = cfg.get("role", "standalone")
+    layer_start = 0
+    layer_end = N_LAYERS
+    if role == "coordinator":
+        layer_end = cfg.get("split_layer", 24)
+
+    # Validate cache for the layers this process will use
     with open(os.path.join(cache_dir, "index.json")) as f:
         idx = json.load(f)
     cached_layers = sorted(int(k) for k in idx["layers"].keys())
-    missing = [i for i in range(N_LAYERS) if i not in cached_layers]
+    missing = [i for i in range(layer_start, layer_end) if i not in cached_layers]
     if missing:
         print(f"ERROR: Missing layers in cache: {missing}")
         sys.exit(1)
@@ -377,8 +384,8 @@ def cmd_serve():
     _tokenizer = _init_tokenizer(model_path)
     print(" done")
 
-    # Init engine
-    _engine = NWSEngine(model_path, cache_dir)
+    # Init engine with the appropriate layer range
+    _engine = NWSEngine(model_path, cache_dir, layer_start=layer_start, layer_end=layer_end)
 
     # Calibrate and pin
     cal_prompt = "The key insight about mixture-of-experts models is that"
@@ -387,9 +394,8 @@ def cmd_serve():
                         prompt_tokens=cal_tokens)
 
     # Connect to worker if coordinator mode
-    if cfg.get("role") == "coordinator":
+    if role == "coordinator":
         from .distributed import WorkerConnection
-        import time as _time
         worker_host = cfg.get("worker_host", "localhost")
         worker_port = cfg.get("worker_port", 9100)
         print(f"\nConnecting to worker at {worker_host}:{worker_port}...")
@@ -403,7 +409,7 @@ def cmd_serve():
             except (ConnectionRefusedError, OSError) as e:
                 retries += 1
                 print(f"  retry {retries}/12: {e}")
-                _time.sleep(5)
+                time.sleep(5)
         else:
             print("WARNING: Could not connect to worker. Running in degraded mode.")
             wc = None

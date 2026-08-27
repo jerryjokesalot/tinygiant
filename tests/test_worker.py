@@ -2,7 +2,6 @@
 import threading
 
 import numpy as np
-import pytest
 
 from tinygiant._constants import EMBED_DIM
 from tinygiant.distributed import (

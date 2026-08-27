@@ -7,11 +7,8 @@ Hidden state: int32 pos + float32[2048] = 8196 bytes per FORWARD.
 import socket
 import struct
 import threading
-import time
 
 import numpy as np
-
-from ._constants import EMBED_DIM
 
 # Message types
 MSG_FORWARD = 1

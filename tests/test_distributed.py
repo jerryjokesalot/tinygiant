@@ -8,6 +8,7 @@ from tinygiant.distributed import (
     MSG_FORWARD, MSG_RESULT, MSG_RESET, MSG_RESET_ACK,
     MSG_PING, MSG_PONG, MSG_SHUTDOWN,
     send_msg, recv_msg, pack_forward, unpack_forward,
+    WorkerConnection, WorkerServer,
 )
 
 
@@ -81,7 +82,6 @@ def test_send_recv_forward_payload():
     server_sock.listen(1)
 
     x_in = np.random.randn(2048).astype(np.float32)
-    result = {}
 
     def server_thread():
         conn, _ = server_sock.accept()
@@ -107,16 +107,12 @@ def test_send_recv_forward_payload():
     np.testing.assert_allclose(x_out, x_in * 2)
 
 
-from tinygiant.distributed import WorkerConnection, WorkerServer
-
-
 def test_worker_connection_forward_round_trip():
     """Full coordinator→worker forward round-trip over localhost."""
     server = WorkerServer(0)  # OS-assigned port
     port = server._sock.getsockname()[1]
 
     x_in = np.random.randn(2048).astype(np.float32)
-    result = {}
 
     def worker_thread():
         conn = server.accept()

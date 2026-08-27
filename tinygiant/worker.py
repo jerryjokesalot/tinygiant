@@ -4,8 +4,6 @@ import argparse
 import json
 import os
 
-import numpy as np
-
 from ._constants import N_LAYERS
 from .distributed import (
     MSG_FORWARD, MSG_RESET, MSG_PING, MSG_SHUTDOWN,

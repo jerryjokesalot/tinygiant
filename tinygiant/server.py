@@ -31,6 +31,7 @@ STOP_TOKENS = set()
 _engine = None
 _tokenizer = None
 _model_name = "tinygiant-qwen3-30b"
+_degraded = False
 
 
 def _init_tokenizer(model_path):
@@ -105,7 +106,11 @@ class Handler(BaseHTTPRequestHandler):
                 }]
             })
         elif self.path == "/health":
-            self._send_json(200, {"status": "ok", "model": _model_name})
+            self._send_json(200, {
+                "status": "ok" if not _degraded else "degraded",
+                "model": _model_name,
+                "distributed": not _degraded,
+            })
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -118,6 +123,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def _handle_paperclip(self):
+        global _degraded
+        if _degraded:
+            self._send_json(503, {"error": {"message": "Worker unavailable — distributed inference degraded"}})
+            return
+
         body = self._read_body()
 
         prompt_text = body.get("prompt", "")
@@ -136,15 +146,20 @@ class Handler(BaseHTTPRequestHandler):
 
         _engine.reset_kv()
 
-        generated = []
-        finish_reason = "length"
-        for token_id in _engine.generate_stream(tokens, n_tokens=max_tokens,
-                                                 temperature=temperature,
-                                                 top_p=top_p):
-            if token_id in STOP_TOKENS:
-                finish_reason = "stop"
-                break
-            generated.append(token_id)
+        try:
+            generated = []
+            finish_reason = "length"
+            for token_id in _engine.generate_stream(tokens, n_tokens=max_tokens,
+                                                     temperature=temperature,
+                                                     top_p=top_p):
+                if token_id in STOP_TOKENS:
+                    finish_reason = "stop"
+                    break
+                generated.append(token_id)
+        except (ConnectionError, OSError):
+            _degraded = True
+            self._send_json(503, {"error": {"message": "Worker connection lost"}})
+            return
 
         raw_text = _detokenize(generated)
         text = _clean_output(raw_text)
@@ -163,6 +178,11 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_chat(self):
+        global _degraded
+        if _degraded:
+            self._send_json(503, {"error": {"message": "Worker unavailable — distributed inference degraded"}})
+            return
+
         body = self._read_body()
 
         messages = body.get("messages", [])
@@ -182,12 +202,16 @@ class Handler(BaseHTTPRequestHandler):
 
         _engine.reset_kv()
 
-        if stream:
-            self._stream_response(tokens, request_id, created,
-                                  temperature, max_tokens, top_p)
-        else:
-            self._full_response(tokens, request_id, created,
-                                temperature, max_tokens, top_p)
+        try:
+            if stream:
+                self._stream_response(tokens, request_id, created,
+                                      temperature, max_tokens, top_p)
+            else:
+                self._full_response(tokens, request_id, created,
+                                    temperature, max_tokens, top_p)
+        except (ConnectionError, OSError):
+            _degraded = True
+            self._send_json(503, {"error": {"message": "Worker connection lost"}})
 
     def _stream_response(self, tokens, request_id, created,
                          temperature, max_tokens, top_p):
@@ -415,6 +439,9 @@ def cmd_serve():
             wc = None
         if wc:
             _engine.set_worker(wc)
+        else:
+            global _degraded
+            _degraded = True
 
     # Start server
     server = HTTPServer((args.host, args.port), Handler)

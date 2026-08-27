@@ -218,7 +218,11 @@ class NWSEngine:
                 x = self._layer_forward(x, i, pos)
             else:
                 x = self._layer_forward_numpy(x, i, pos)
-        x = self._worker.forward(x, pos)
+        try:
+            x = self._worker.forward(x, pos)
+        except (ConnectionError, OSError):
+            self._worker = None
+            raise
         self.kv_len = pos + 1
         if self.tg_lib:
             out = np.empty(EMBED_DIM, dtype=np.float32)

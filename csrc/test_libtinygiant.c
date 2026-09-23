@@ -10,7 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <arm_neon.h>
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 #define QK_K      256
 #define Q4K_BSIZE 144

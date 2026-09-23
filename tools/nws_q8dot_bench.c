@@ -15,6 +15,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <fcntl.h>
@@ -22,7 +23,11 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/stat.h>
-#include <arm_neon.h>
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 #define EMBED     2048
 #define INTER     768
@@ -92,7 +97,8 @@ typedef struct {
 static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
     for (int b = 0; b < n_blocks; b++) {
         const float *xb = x + b * QK;
-        /* Find max abs with NEON */
+
+#if defined(__ARM_NEON)
         float32x4_t vmax = vdupq_n_f32(0);
         for (int i = 0; i < QK; i += 4) {
             float32x4_t v = vld1q_f32(xb + i);
@@ -104,7 +110,6 @@ static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
         float inv = amax > 0 ? 127.f / amax : 0;
         out[b].scale = sc;
 
-        /* Quantize with NEON */
         int32x4_t vsum = vdupq_n_s32(0);
         float32x4_t vinv = vdupq_n_f32(inv);
         for (int i = 0; i < QK; i += 4) {
@@ -117,6 +122,63 @@ static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
             vsum = vaddq_s32(vsum, rounded);
         }
         out[b].sum = vaddvq_s32(vsum);
+#elif defined(__AVX2__)
+        __m256 vmax = _mm256_setzero_ps();
+        __m256 sign_mask = _mm256_set1_ps(-0.0f);
+        for (int i = 0; i < QK; i += 8) {
+            __m256 v = _mm256_loadu_ps(xb + i);
+            __m256 abs_v = _mm256_andnot_ps(sign_mask, v);
+            vmax = _mm256_max_ps(vmax, abs_v);
+        }
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(vmax, 0), _mm256_extractf128_ps(vmax, 1));
+        max4 = _mm_max_ps(max4, _mm_shuffle_ps(max4, max4, _MM_SHUFFLE(1, 0, 3, 2)));
+        max4 = _mm_max_ps(max4, _mm_shuffle_ps(max4, max4, _MM_SHUFFLE(2, 3, 0, 1)));
+        float amax = _mm_cvtss_f32(max4);
+
+        float sc = amax / 127.f;
+        float inv = amax > 0 ? 127.f / amax : 0;
+        out[b].scale = sc;
+
+        int32_t sum = 0;
+        __m256 vinv = _mm256_set1_ps(inv);
+        for (int i = 0; i < QK; i += 8) {
+            __m256 v = _mm256_loadu_ps(xb + i);
+            __m256 scaled = _mm256_mul_ps(v, vinv);
+            __m256i rounded = _mm256_cvtps_epi32(scaled);
+
+            __m128i r_lo = _mm256_castsi256_si128(rounded);
+            __m128i r_hi = _mm256_extracti128_si256(rounded, 1);
+            __m128i pack16 = _mm_packs_epi32(r_lo, r_hi);
+            __m128i pack8 = _mm_packs_epi16(pack16, pack16);
+            _mm_storel_epi64((__m128i*)(out[b].qs + i), pack8);
+
+            sum += _mm_extract_epi32(r_lo, 0) + _mm_extract_epi32(r_lo, 1) +
+                   _mm_extract_epi32(r_lo, 2) + _mm_extract_epi32(r_lo, 3) +
+                   _mm_extract_epi32(r_hi, 0) + _mm_extract_epi32(r_hi, 1) +
+                   _mm_extract_epi32(r_hi, 2) + _mm_extract_epi32(r_hi, 3);
+        }
+        out[b].sum = sum;
+#else
+        float amax = 0.0f;
+        for (int i = 0; i < QK; i++) {
+            float v = fabsf(xb[i]);
+            if (v > amax) amax = v;
+        }
+
+        float sc = amax / 127.f;
+        float inv = amax > 0 ? 127.f / amax : 0;
+        out[b].scale = sc;
+
+        int32_t sum = 0;
+        for (int i = 0; i < QK; i++) {
+            int val = (int)roundf(xb[i] * inv);
+            if (val > 127) val = 127;
+            if (val < -128) val = -128;
+            out[b].qs[i] = (int8_t)val;
+            sum += val;
+        }
+        out[b].sum = sum;
+#endif
     }
 }
 
@@ -139,9 +201,10 @@ static float dot_scalar(const uint8_t *q4, const float *x, int bpr) {
     return sum;
 }
 
-/* ═══ Kernel 2: Float NEON ═══ */
+/* ═══ Kernel 2: Float SIMD ═══ */
 
 static float dot_neon_f32(const uint8_t *q4, const float *x, int bpr) {
+#if defined(__ARM_NEON)
     float total = 0;
     const uint8x16_t m0f = vdupq_n_u8(0x0F);
     for (int b = 0; b < bpr; b++) {
@@ -157,7 +220,6 @@ static float dot_neon_f32(const uint8_t *q4, const float *x, int bpr) {
             uint8x16_t lo = vandq_u8(raw, m0f), hi = vshrq_n_u8(raw, 4);
             uint8x8x2_t z0 = vzip_u8(vget_low_u8(lo), vget_low_u8(hi));
             uint8x8x2_t z1 = vzip_u8(vget_high_u8(lo), vget_high_u8(hi));
-            /* 4 groups of 8 interleaved nibbles → 4 × (widen + FMA) */
             uint8x8_t chunks[4] = {z0.val[0], z0.val[1], z1.val[0], z1.val[1]};
             for (int g = 0; g < 4; g++) {
                 uint16x8_t w = vmovl_u8(chunks[g]);
@@ -173,11 +235,15 @@ static float dot_neon_f32(const uint8_t *q4, const float *x, int bpr) {
                - dm * vaddvq_f32(vaddq_f32(sa, sb));
     }
     return total;
+#else
+    return dot_scalar(q4, x, bpr);
+#endif
 }
 
-/* ═══ Kernel 3: Q8 + vdotq_s32 NEON ═══ */
+/* ═══ Kernel 3: Q8 Integer SIMD ═══ */
 
 static float dot_q4_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
+#if defined(__ARM_NEON)
     float total = 0;
     const uint8x16_t m0f = vdupq_n_u8(0x0F);
 
@@ -190,19 +256,16 @@ static float dot_q4_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
 
         int32x4_t iacc = vdupq_n_s32(0);
 
-        /* 128 Q4 bytes = 256 values. Process 16 bytes (32 values) per iter = 8 iters */
         for (int j = 0; j < 128; j += 16) {
             uint8x16_t raw = vld1q_u8(qs + j);
             uint8x16_t lo = vandq_u8(raw, m0f);
             uint8x16_t hi = vshrq_n_u8(raw, 4);
 
-            /* First 8 bytes: interleave lo/hi nibbles */
             uint8x8x2_t z0 = vzip_u8(vget_low_u8(lo), vget_low_u8(hi));
             int8x16_t q4a = vreinterpretq_s8_u8(vcombine_u8(z0.val[0], z0.val[1]));
             int8x16_t x8a = vld1q_s8(xqs + j * 2);
             iacc = vdotq_s32(iacc, q4a, x8a);
 
-            /* Second 8 bytes */
             uint8x8x2_t z1 = vzip_u8(vget_high_u8(lo), vget_high_u8(hi));
             int8x16_t q4b = vreinterpretq_s8_u8(vcombine_u8(z1.val[0], z1.val[1]));
             int8x16_t x8b = vld1q_s8(xqs + j * 2 + 16);
@@ -214,6 +277,64 @@ static float dot_q4_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
         total += d * sx * (float)idot - dm * sx * (float)xq[b].sum;
     }
     return total;
+#elif defined(__AVX2__)
+    float total = 0;
+    __m256i ones_16 = _mm256_set1_epi16(1);
+
+    for (int b = 0; b < bpr; b++) {
+        const uint8_t *bl = q4 + b * Q4_BSIZE;
+        uint16_t dr, dmr; memcpy(&dr, bl, 2); memcpy(&dmr, bl+2, 2);
+        float d = f16_to_f32(dr), dm = f16_to_f32(dmr);
+        const uint8_t *qs = bl + Q4_HDR;
+        const int8_t *xqs = xq[b].qs;
+
+        int32_t idot = 0;
+        for (int j = 0; j < 128; j += 16) {
+            __m128i raw = _mm_loadu_si128((const __m128i *)(qs + j));
+            __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+
+            __m128i z0_lo = _mm_unpacklo_epi8(lo, hi);
+            __m128i z0_hi = _mm_unpackhi_epi8(lo, hi);
+
+            __m128i x8a = _mm_loadu_si128((const __m128i *)(xqs + j * 2));
+            __m128i x8b = _mm_loadu_si128((const __m128i *)(xqs + j * 2 + 16));
+
+            __m128i prod_a = _mm_maddubs_epi16(z0_lo, x8a);
+            __m128i prod_b = _mm_maddubs_epi16(z0_hi, x8b);
+
+            __m128i sum_a = _mm_madd_epi16(prod_a, _mm_set1_epi16(1));
+            __m128i sum_b = _mm_madd_epi16(prod_b, _mm_set1_epi16(1));
+
+            idot += _mm_extract_epi32(sum_a, 0) + _mm_extract_epi32(sum_a, 1) +
+                    _mm_extract_epi32(sum_a, 2) + _mm_extract_epi32(sum_a, 3) +
+                    _mm_extract_epi32(sum_b, 0) + _mm_extract_epi32(sum_b, 1) +
+                    _mm_extract_epi32(sum_b, 2) + _mm_extract_epi32(sum_b, 3);
+        }
+
+        float sx = xq[b].scale;
+        total += d * sx * (float)idot - dm * sx * (float)xq[b].sum;
+    }
+    return total;
+#else
+    float total = 0;
+    for (int b = 0; b < bpr; b++) {
+        const uint8_t *bl = q4 + b * Q4_BSIZE;
+        uint16_t dr, dmr; memcpy(&dr, bl, 2); memcpy(&dmr, bl+2, 2);
+        float d = f16_to_f32(dr), dm = f16_to_f32(dmr);
+        const uint8_t *qs = bl + Q4_HDR;
+        const int8_t *xqs = xq[b].qs;
+        int32_t idot = 0;
+        for (int j = 0; j < 128; j++) {
+            uint8_t v = qs[j];
+            idot += (int32_t)(v & 0xF) * (int32_t)xqs[j * 2]
+                  + (int32_t)(v >> 4)   * (int32_t)xqs[j * 2 + 1];
+        }
+        float sx = xq[b].scale;
+        total += d * sx * (float)idot - dm * sx * (float)xq[b].sum;
+    }
+    return total;
+#endif
 }
 
 /* ═══ Expert forward passes ═══ */
@@ -301,7 +422,10 @@ static IoPipe *io_new(void) {
     pthread_cond_init(&io->req, NULL);
     pthread_cond_init(&io->resp, NULL);
     for (int i = 0; i < N_ACT; i++) io->bufs[i] = malloc(EXPERT_Q4);
-    io->fd = open(CACHE, O_RDONLY); fcntl(io->fd, F_NOCACHE, 1);
+    io->fd = open(CACHE, O_RDONLY);
+#ifdef F_NOCACHE
+    fcntl(io->fd, F_NOCACHE, 1);
+#endif
     return io;
 }
 

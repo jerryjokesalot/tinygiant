@@ -37,6 +37,7 @@ $(LIB): $(SRC)
 test: csrc/test_libtinygiant.c $(SRC)
 	$(CC) $(CFLAGS) -o test_libtinygiant csrc/test_libtinygiant.c -lm
 	./test_libtinygiant
-
+nws_q8dot_bench: tools/nws_q8dot_bench.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
 clean:
 	rm -f tinygiant/libtinygiant.dylib tinygiant/libtinygiant.so test_libtinygiant

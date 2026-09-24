@@ -139,12 +139,16 @@ Requires Python 3.9+ and a GGUF model file. The C benchmarks need macOS with the
 ### Build the expert-contiguous cache
 
 ```bash
+# Initialise venv
+python -m venv .
+. bin/activate
 # Install dependencies
 pip install gguf numpy
-
+# Install the package itself
+pip install -e .
 # Build contiguous cache from GGUF model
 # Processes all 48 layers, takes ~2.5 minutes, outputs ~54 GB (float16)
-python3 tools/nws_expert_relayout.py ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
+tinygiant-setup --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf --cache /path/to/output_cache_dir --format q4
 ```
 
 ### Run end-to-end inference

@@ -15,6 +15,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <fcntl.h>
@@ -22,7 +23,6 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/stat.h>
-#include <Accelerate/Accelerate.h>
 
 /* Qwen3-30B-A3B dimensions */
 #define EMBED     2048
@@ -231,7 +231,9 @@ static IoPipeline *io_create(void) {
         io->result_bufs[i] = malloc(EXPERT_Q4_BYTES);
     io->fd = open(CACHE_FILE, O_RDONLY);
     if (io->fd < 0) { perror("open cache"); exit(1); }
+#ifdef F_NOCACHE
     fcntl(io->fd, F_NOCACHE, 1);
+#endif
     return io;
 }
 

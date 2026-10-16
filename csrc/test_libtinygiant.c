@@ -1,7 +1,7 @@
 /*
  * test_libtinygiant.c — Verify Q4_K × Q8 kernel correctness
  *
- * Tests the NEON kernel against the scalar reference, and both
+ * Tests the optimized kernel against the scalar reference, and both
  * against gguf_dequantize → numpy matmul (via known test vectors).
  *
  * Compile: clang -O3 -mcpu=apple-m1 -o test_libtinygiant tools/test_libtinygiant.c -lm
@@ -109,8 +109,8 @@ int main(void) {
     int pass = 1;
     int n_tests = 100;
 
-    /* Test 1a: NEON Q4K×Q8 vs SCALAR Q4K×Q8 (same Q8 data — isolates NEON bugs) */
-    printf("Test 1a: NEON vs scalar Q4K×Q8 (same Q8 input, %d trials)\n", n_tests);
+    /* Test 1a: optimized Q4K×Q8 vs scalar (same Q8 data isolates SIMD bugs) */
+    printf("Test 1a: optimized vs scalar Q4K×Q8 (same Q8 input, %d trials)\n", n_tests);
     {
         float max_rel_err = 0;
         for (int trial = 0; trial < n_tests; trial++) {
@@ -126,17 +126,17 @@ int main(void) {
             quantize_q8(x, xq, 1);
 
             float scalar_q8 = dot_q4k_q8_scalar_ref(block, xq, 1);
-            float neon_q8   = dot_q4k_q8(block, xq, 1);
+            float optimized_q8 = dot_q4k_q8(block, xq, 1);
 
             float denom = fabsf(scalar_q8) > 1e-3f ? fabsf(scalar_q8) : 1.0f;
-            float rel_err = fabsf(scalar_q8 - neon_q8) / denom;
+            float rel_err = fabsf(scalar_q8 - optimized_q8) / denom;
             if (rel_err > max_rel_err) max_rel_err = rel_err;
         }
         printf("  Max relative error: %.4e\n", max_rel_err);
         if (max_rel_err < 1e-4f) {
-            printf("  PASS (NEON matches scalar Q8 reference)\n\n");
+            printf("  PASS (optimized kernel matches scalar Q8 reference)\n\n");
         } else {
-            printf("  FAIL (NEON kernel has a bug)\n\n");
+            printf("  FAIL (optimized kernel has a bug)\n\n");
             pass = 0;
         }
     }
@@ -179,7 +179,7 @@ int main(void) {
             float x[QK_K];
             srand(trial * 23 + 5);
             for (int i = 0; i < QK_K; i++)
-                x[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+                x[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 0.1f;
 
             /* Manual: dequant then float dot */
             float deq[QK_K];
@@ -201,8 +201,8 @@ int main(void) {
         }
     }
 
-    /* Test 3: Multi-block matmul — NEON vs scalar with same Q8 input */
-    printf("Test 3: Matrix-vector multiply (768x2048, NEON Q8 vs scalar Q8)\n");
+    /* Test 3: Multi-block matmul — optimized vs scalar with same Q8 input */
+    printf("Test 3: Matrix-vector multiply (768x2048, optimized Q8 vs scalar Q8)\n");
     {
         int nrows = 768, ncols = 2048;
         int bpr = ncols / QK_K;
@@ -224,19 +224,19 @@ int main(void) {
         quantize_q8(x, xq, bpr);
 
         float *out_scalar = calloc(nrows, sizeof(float));
-        float *out_neon = calloc(nrows, sizeof(float));
+        float *out_optimized = calloc(nrows, sizeof(float));
 
         /* Scalar Q8 reference */
         for (int r = 0; r < nrows; r++)
             out_scalar[r] = dot_q4k_q8_scalar_ref(
                 mat + (size_t)r * bpr * Q4K_BSIZE, xq, bpr);
 
-        /* NEON Q8 */
-        matmul_q4k(mat, x, out_neon, nrows, ncols);
+        /* Architecture-specific optimized Q8 */
+        matmul_q4k(mat, x, out_optimized, nrows, ncols);
 
         float max_rel = 0, max_abs = 0;
         for (int r = 0; r < nrows; r++) {
-            float abs_err = fabsf(out_scalar[r] - out_neon[r]);
+            float abs_err = fabsf(out_scalar[r] - out_optimized[r]);
             float denom = fabsf(out_scalar[r]) > 1e-3f ? fabsf(out_scalar[r]) : 1.0f;
             float rel = abs_err / denom;
             if (rel > max_rel) max_rel = rel;
@@ -252,7 +252,7 @@ int main(void) {
             pass = 0;
         }
 
-        free(mat); free(out_scalar); free(out_neon);
+        free(mat); free(out_scalar); free(out_optimized);
     }
 
     /* Test 4: Expert forward pass smoke test */
@@ -277,7 +277,7 @@ int main(void) {
         float input[2048], output[2048];
         srand(54321);
         for (int i = 0; i < 2048; i++)
-            input[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f;
+            input[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 0.01f;
         memset(output, 0, sizeof(output));
 
         tg_expert_forward(expert, input, output, 0.125f, embed, inter);
@@ -294,6 +294,38 @@ int main(void) {
         }
 
         free(expert);
+    }
+
+    /* Test 5: attention SIMD helpers match scalar math, including tail values */
+    printf("Test 5: Attention vector helpers match scalar reference\n");
+    {
+        enum { N = 131 };
+        float a[N], b[N], output[N], expected[N];
+        float expected_dot = 0.0f;
+        for (int i = 0; i < N; i++) {
+            a[i] = ((float)((i * 17) % 29) - 14.0f) / 31.0f;
+            b[i] = ((float)((i * 11) % 23) - 11.0f) / 19.0f;
+            output[i] = expected[i] = ((float)(i % 7) - 3.0f) / 13.0f;
+            expected_dot += a[i] * b[i];
+            expected[i] += 0.375f * b[i];
+        }
+
+        float actual_dot = tg_dot_f32(a, b, N);
+        tg_accumulate_scaled_f32(output, b, 0.375f, N);
+
+        float max_axpy_error = 0.0f;
+        for (int i = 0; i < N; i++) {
+            float error = fabsf(output[i] - expected[i]);
+            if (error > max_axpy_error) max_axpy_error = error;
+        }
+        float dot_error = fabsf(actual_dot - expected_dot);
+        printf("  Dot error: %.4e, scaled-add error: %.4e\n", dot_error, max_axpy_error);
+        if (dot_error < 1e-4f && max_axpy_error < 1e-6f) {
+            printf("  PASS (SIMD body and scalar tail match)\n\n");
+        } else {
+            printf("  FAIL\n\n");
+            pass = 0;
+        }
     }
 
     printf("==================================\n");

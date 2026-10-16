@@ -8,7 +8,8 @@ Modern Mixture-of-Experts (MoE) models like Qwen3-30B activate only **3 billion*
 
 ## Results
 
-Measured on an **M1 MacBook Air with 16GB RAM** and its stock NVMe SSD.
+Measured on an **M1 MacBook Air with 16GB RAM** and its stock NVMe SSD. 
+Also some measurements on ancient **Dell Latitude 3470** equiped with WD SSD connected over SATA interface.
 
 ### Fused Q4 compute ceiling (25.9 tok/s)
 
@@ -67,6 +68,11 @@ The old approach dequantized Q4 to f32 in RAM (18 MB write), then ran Accelerate
 | Standard loading (dense 32B) | <1 tok/s | 20 GB+ (swap thrashing) |
 | Standard loading (MoE 30B) | 1.7 tok/s | 11.3 GB |
 | Expert Cascade (simulated compute) | 4.7 tok/s | ~2 GB |
+
+### Results for Intel/linux hardware
+
+On linux + intel (skylake, Intel(R) Core(TM) i5-6200U CPU @ 2.30GHz x 4 cores + SSD over SATA) this code generates at 0.43 tok/s on MoE 30B model with 48 experts mode.
+
 
 ## How It Works
 
@@ -133,12 +139,16 @@ Requires Python 3.9+ and a GGUF model file. The C benchmarks need macOS with the
 ### Build the expert-contiguous cache
 
 ```bash
+# Initialise venv
+python -m venv .
+. bin/activate
 # Install dependencies
 pip install gguf numpy
-
+# Install the package itself
+pip install -e .
 # Build contiguous cache from GGUF model
 # Processes all 48 layers, takes ~2.5 minutes, outputs ~54 GB (float16)
-python3 tools/nws_expert_relayout.py ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
+tinygiant-setup --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf --cache /path/to/output_cache_dir --format q4
 ```
 
 ### Run end-to-end inference

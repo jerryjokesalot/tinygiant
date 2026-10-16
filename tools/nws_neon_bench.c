@@ -10,6 +10,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <fcntl.h>
@@ -17,7 +18,11 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <sys/stat.h>
-#include <arm_neon.h>
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 #define EMBED     2048
 #define INTER     768
@@ -120,6 +125,7 @@ static float dot_q4_scalar(const uint8_t *q4_row, const float *x, int bpr) {
  * 5. vfmaq_f32: multiply-accumulate with x
  */
 static float dot_q4_neon(const uint8_t *q4_row, const float *x, int bpr) {
+#if defined(__ARM_NEON)
     float total = 0;
     const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
 
@@ -137,18 +143,15 @@ static float dot_q4_neon(const uint8_t *q4_row, const float *x, int bpr) {
         float32x4_t dot_a = vdupq_n_f32(0), dot_b = vdupq_n_f32(0);
         float32x4_t xs_a  = vdupq_n_f32(0), xs_b  = vdupq_n_f32(0);
 
-        /* 128 Q4 bytes = 256 values. Process 16 bytes (32 vals) per iteration = 8 iters */
         for (int j = 0; j < 128; j += 16) {
             uint8x16_t raw = vld1q_u8(qs + j);
             uint8x16_t lo  = vandq_u8(raw, mask_0f);
             uint8x16_t hi  = vshrq_n_u8(raw, 4);
 
-            /* First 8 bytes: lo[0..7], hi[0..7] → interleaved pairs */
             uint8x8_t lo_0 = vget_low_u8(lo);
             uint8x8_t hi_0 = vget_low_u8(hi);
             uint8x8x2_t z0 = vzip_u8(lo_0, hi_0);
 
-            /* z0.val[0] = lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3 → 8 values for x[2j..2j+7] */
             {
                 uint16x8_t w = vmovl_u8(z0.val[0]);
                 float32x4_t fa = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w)));
@@ -161,7 +164,6 @@ static float dot_q4_neon(const uint8_t *q4_row, const float *x, int bpr) {
                 xs_b = vaddq_f32(xs_b, xb_);
             }
 
-            /* z0.val[1] = lo4,hi4,lo5,hi5,lo6,hi6,lo7,hi7 → x[2j+8..2j+15] */
             {
                 uint16x8_t w = vmovl_u8(z0.val[1]);
                 float32x4_t fa = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w)));
@@ -174,7 +176,6 @@ static float dot_q4_neon(const uint8_t *q4_row, const float *x, int bpr) {
                 xs_b = vaddq_f32(xs_b, xb_);
             }
 
-            /* Second 8 bytes: lo[8..15], hi[8..15] */
             uint8x8_t lo_1 = vget_high_u8(lo);
             uint8x8_t hi_1 = vget_high_u8(hi);
             uint8x8x2_t z1 = vzip_u8(lo_1, hi_1);
@@ -209,6 +210,9 @@ static float dot_q4_neon(const uint8_t *q4_row, const float *x, int bpr) {
         total += d * dot_sum - dmin * x_sum;
     }
     return total;
+#else
+    return dot_q4_scalar(q4_row, x, bpr);
+#endif
 }
 
 /* ═══ Expert forward pass ═══ */
@@ -276,7 +280,9 @@ static IoPipe *io_create(void) {
     pthread_cond_init(&io->resp_cond, NULL);
     for (int i = 0; i < N_ACT; i++) io->result_bufs[i] = malloc(EXPERT_Q4);
     io->fd = open(CACHE_FILE, O_RDONLY);
+#ifdef F_NOCACHE
     fcntl(io->fd, F_NOCACHE, 1);
+#endif
     return io;
 }
 

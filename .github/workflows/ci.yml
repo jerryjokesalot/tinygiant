@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-24.04
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: macOS Intel
+            runner: macos-15-intel
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest -e .
+
+      - name: Test native kernels
+        run: make test
+
+      - name: Build native library
+        run: make all
+
+      - name: Test Python package
+        run: |
+          if find tests -type f -name 'test_*.py' -print -quit 2>/dev/null | grep -q .; then
+            python -m pytest -q
+          else
+            python -m compileall -q tinygiant
+            python -c "import tinygiant; print('tinygiant import OK')"
+          fi
+
+      - name: Smoke-test attention benchmark
+        run: |
+          make nws_attention_bench
+          ./nws_attention_bench

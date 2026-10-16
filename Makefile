@@ -16,7 +16,7 @@ else
   CC = gcc
   CFLAGS = -O3
   SHARED_FLAGS = -shared -fPIC
-  ifeq ($(ARCH),arm64)
+  ifneq (,$(filter $(ARCH),arm64 aarch64))
     CFLAGS += -march=armv8.2-a+dotprod
   endif
   ifeq ($(ARCH),x86_64)

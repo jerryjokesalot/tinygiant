@@ -10,6 +10,7 @@ __pycache__/
 *.so
 *.o
 test_libtinygiant
+nws_*_bench
 dist/
 *.egg-info/
 

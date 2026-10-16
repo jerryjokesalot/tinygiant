@@ -4,16 +4,18 @@ ARCH := $(shell uname -m)
 ifeq ($(UNAME),Darwin)
   CC = clang
   CFLAGS = -O3
+  SHARED_FLAGS = -dynamiclib
   LIB = tinygiant/libtinygiant.dylib
   ifeq ($(ARCH),arm64)
     CFLAGS += -mcpu=apple-m1
   endif
   ifeq ($(ARCH),x86_64)
-    CLFAGS += -march=native
+    CFLAGS += -march=native
   endif
 else
   CC = gcc
   CFLAGS = -O3
+  SHARED_FLAGS = -shared -fPIC
   ifeq ($(ARCH),arm64)
     CFLAGS += -march=armv8.2-a+dotprod
   endif
@@ -23,8 +25,6 @@ else
   LIB = tinygiant/libtinygiant.so
 endif
 
-LIB = tinygiant/libtinygiant.so
-
 SRC = csrc/libtinygiant.c
 
 .PHONY: all clean test
@@ -32,12 +32,14 @@ SRC = csrc/libtinygiant.c
 all: $(LIB)
 
 $(LIB): $(SRC)
-	$(CC) -shared -fPIC $(CFLAGS) -o $@ $<
+	$(CC) $(SHARED_FLAGS) $(CFLAGS) -o $@ $<
 
 test: csrc/test_libtinygiant.c $(SRC)
 	$(CC) $(CFLAGS) -o test_libtinygiant csrc/test_libtinygiant.c -lm
 	./test_libtinygiant
 nws_q8dot_bench: tools/nws_q8dot_bench.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
+nws_attention_bench: tools/nws_attention_bench.c $(SRC)
+	$(CC) $(CFLAGS) -o $@ $< -lm
 clean:
-	rm -f tinygiant/libtinygiant.dylib tinygiant/libtinygiant.so test_libtinygiant
+	rm -f tinygiant/libtinygiant.dylib tinygiant/libtinygiant.so test_libtinygiant nws_attention_bench

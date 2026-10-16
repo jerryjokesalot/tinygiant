@@ -5,10 +5,10 @@
  * ARM NEON + vdotq_s32 for the hot path.
  *
  * Build (macOS):
- *   clang -shared -O3 -mcpu=apple-m1 -o libtinygiant.dylib tools/libtinygiant.c
+ *   clang -dynamiclib -O3 -mcpu=apple-m1 -o libtinygiant.dylib csrc/libtinygiant.c
  *
  * Build (Linux aarch64):
- *   gcc -shared -fPIC -O3 -march=armv8.2-a+dotprod -o libtinygiant.so tools/libtinygiant.c
+ *   gcc -shared -fPIC -O3 -march=armv8.2-a+dotprod -o libtinygiant.so csrc/libtinygiant.c
  */
 #include <stdint.h>
 #include <string.h>
@@ -23,6 +23,58 @@
 
 #define QK_K      256
 #define Q4K_BSIZE 144   /* 2(d) + 2(dmin) + 12(scales) + 128(qs) */
+
+/* ═══ Portable vector helpers for attention ═══ */
+
+static inline float tg_dot_f32(const float *a, const float *b, int n) {
+    int i = 0;
+    float result = 0.0f;
+
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 3 < n; i += 4)
+        acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    result = vaddvq_f32(acc);
+#elif defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    for (; i + 7 < n; i += 8)
+        acc = _mm256_add_ps(acc,
+                            _mm256_mul_ps(_mm256_loadu_ps(a + i),
+                                          _mm256_loadu_ps(b + i)));
+    __m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(acc),
+                             _mm256_extractf128_ps(acc, 1));
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    result = _mm_cvtss_f32(sum4);
+#endif
+
+    for (; i < n; i++) result += a[i] * b[i];
+    return result;
+}
+
+static inline void tg_accumulate_scaled_f32(float *dst, const float *src,
+                                             float scale, int n) {
+    int i = 0;
+
+#if defined(__ARM_NEON)
+    float32x4_t vscale = vdupq_n_f32(scale);
+    for (; i + 3 < n; i += 4) {
+        float32x4_t value = vld1q_f32(dst + i);
+        value = vfmaq_f32(value, vscale, vld1q_f32(src + i));
+        vst1q_f32(dst + i, value);
+    }
+#elif defined(__AVX2__)
+    __m256 vscale = _mm256_set1_ps(scale);
+    for (; i + 7 < n; i += 8) {
+        __m256 value = _mm256_loadu_ps(dst + i);
+        value = _mm256_add_ps(value,
+                              _mm256_mul_ps(vscale, _mm256_loadu_ps(src + i)));
+        _mm256_storeu_ps(dst + i, value);
+    }
+#endif
+
+    for (; i < n; i++) dst[i] += scale * src[i];
+}
 
 /* ═══ f16 → f32 conversion ═══ */
 
@@ -683,8 +735,7 @@ void tg_attention_decode(
         float max_score = -1e30f;
         for (int t = 0; t < seq_len; t++) {
             const float *kt = k_cache + t * head_dim;
-            float dot = 0;
-            for (int d = 0; d < head_dim; d++) dot += q_h[d] * kt[d];
+            float dot = tg_dot_f32(q_h, kt, head_dim);
             scores[t] = dot * inv_sqrt;
             if (scores[t] > max_score) max_score = scores[t];
         }
@@ -703,7 +754,7 @@ void tg_attention_decode(
         for (int t = 0; t < seq_len; t++) {
             float w = scores[t] * inv_sum;
             const float *vt = v_cache + t * head_dim;
-            for (int d = 0; d < head_dim; d++) out_h[d] += w * vt[d];
+            tg_accumulate_scaled_f32(out_h, vt, w, head_dim);
         }
     }
 
@@ -769,8 +820,7 @@ void tg_attention_decode_q4(
         float max_score = -1e30f;
         for (int t = 0; t < seq_len; t++) {
             const float *kt = k_cache + t * head_dim;
-            float dot = 0;
-            for (int d = 0; d < head_dim; d++) dot += q_h[d] * kt[d];
+            float dot = tg_dot_f32(q_h, kt, head_dim);
             scores[t] = dot * inv_sqrt;
             if (scores[t] > max_score) max_score = scores[t];
         }
@@ -787,7 +837,7 @@ void tg_attention_decode_q4(
         for (int t = 0; t < seq_len; t++) {
             float w = scores[t] * inv_sum;
             const float *vt = v_cache + t * head_dim;
-            for (int d = 0; d < head_dim; d++) out_h[d] += w * vt[d];
+            tg_accumulate_scaled_f32(out_h, vt, w, head_dim);
         }
     }
 

@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-24",
+  "machine": "Apple M1 16GB macOS 26.7",
+  "tinygiant_commit": "2d0a62e",
+  "llama_cpp_commit": "73adf89",
+  "primary_decode_tok_s": {
+    "llama_cpp_cpu_tg128_p1": {
+      "mean": 1.06,
+      "std": 0.05
+    },
+    "llama_cpp_cpu_tg128_p32": {
+      "mean": 1.04,
+      "std": 0.11
+    },
+    "tinygiant_pin_nonuniform": {
+      "mean": 2.6803789450537634,
+      "std": 0.6210257335195705,
+      "n": 15
+    },
+    "tinygiant_pin48": {
+      "mean": 2.7783364133130095,
+      "std": 0.6437689175593033,
+      "n": 15
+    }
+  },
+  "speedup_vs_llama_tg128_p1": {
+    "pin_nonuniform": 2.528659382126192,
+    "pin48": 2.621072088031141
+  },
+  "verdict": "TinyGiant decode still beats llama.cpp CPU on M1 16GB"
+}

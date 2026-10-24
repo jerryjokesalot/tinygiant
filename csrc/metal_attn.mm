@@ -48,7 +48,7 @@ kernel void matvec_f16(
     y[row] = sum;
 }
 
-/* Q4_K × float matvec (matches libtinygiant dot_q4k_scalar). */
+/* Q4_K helpers (matches libtinygiant). */
 inline void get_scale_min_k4(int j, device const uchar *scales,
                              thread uchar &sc, thread uchar &m)
 {
@@ -61,6 +61,85 @@ inline void get_scale_min_k4(int j, device const uchar *scales,
     }
 }
 
+/* Quantize float x into Q8 blocks: scales[b], qs[b*256 + i]. */
+kernel void quantize_q8(
+    device const float *x      [[buffer(0)]],
+    device float       *scales [[buffer(1)]],
+    device char        *qs     [[buffer(2)]],
+    constant uint      &nblk   [[buffer(3)]],
+    uint b [[thread_position_in_grid]])
+{
+    if (b >= nblk) return;
+    device const float *xb = x + b * 256u;
+    float amax = 0.0f;
+    for (uint i = 0; i < 256u; ++i) {
+        float v = fabs(xb[i]);
+        if (v > amax) amax = v;
+    }
+    float sc = amax / 127.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    scales[b] = sc;
+    device char *q = qs + b * 256u;
+    for (uint i = 0; i < 256u; ++i) {
+        int val = int(round(xb[i] * inv));
+        if (val > 127) val = 127;
+        if (val < -128) val = -128;
+        q[i] = char(val);
+    }
+}
+
+/* Q4_K × Q8 matvec — integer path matching CPU NEON hot loop. */
+kernel void matvec_q4k_q8(
+    device const uchar *W      [[buffer(0)]],
+    device const float *xscale [[buffer(1)]],
+    device const char  *xqs    [[buffer(2)]],
+    device float       *y      [[buffer(3)]],
+    constant uint      &cols   [[buffer(4)]],
+    uint row [[thread_position_in_grid]])
+{
+    uint bpr = cols / 256u;
+    device const uchar *rowW = W + ((size_t)row * (size_t)bpr * 144u);
+    float total = 0.0f;
+    for (uint b = 0; b < bpr; ++b) {
+        device const uchar *bl = rowW + b * 144u;
+        device const half *h = (device const half *)bl;
+        float d = float(h[0]);
+        float dmin = float(h[1]);
+        device const uchar *scales = bl + 4;
+        device const uchar *qs = bl + 16;
+        device const char *xq = xqs + b * 256u;
+        float sx = xscale[b];
+        float block_sum = 0.0f;
+        for (uint g = 0; g < 4u; ++g) {
+            uchar sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(int(2u * g),     scales, sc_lo, m_lo);
+            get_scale_min_k4(int(2u * g + 1), scales, sc_hi, m_hi);
+            device const uchar *qs_g = qs + g * 32u;
+            device const char *xq_lo = xq + g * 64u;
+            device const char *xq_hi = xq + g * 64u + 32u;
+            int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
+            for (uint j = 0; j < 32u; ++j) {
+                uchar v = qs_g[j];
+                int nib_lo = int(v & 0xFu);
+                int nib_hi = int(v >> 4);
+                int xl = int(xq_lo[j]);
+                int xh = int(xq_hi[j]);
+                dot_lo += nib_lo * xl;
+                dot_hi += nib_hi * xh;
+                sum_lo += xl;
+                sum_hi += xh;
+            }
+            block_sum += d * float(sc_lo) * float(dot_lo)
+                       - dmin * float(m_lo) * float(sum_lo);
+            block_sum += d * float(sc_hi) * float(dot_hi)
+                       - dmin * float(m_hi) * float(sum_hi);
+        }
+        total += sx * block_sum;
+    }
+    y[row] = total;
+}
+
+/* Fallback Q4_K × float (tests / non-Q8 path). */
 kernel void matvec_q4k(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
@@ -215,6 +294,8 @@ struct MetalAttnCtx {
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> p_matvec_f16;
     id<MTLComputePipelineState> p_matvec_q4k;
+    id<MTLComputePipelineState> p_matvec_q4k_q8;
+    id<MTLComputePipelineState> p_quantize_q8;
     id<MTLComputePipelineState> p_rms;
     id<MTLComputePipelineState> p_rope;
     id<MTLComputePipelineState> p_kv_append;
@@ -240,6 +321,12 @@ struct MetalAttnCtx {
     id<MTLBuffer> u_kv_len;
     id<MTLBuffer> u_seq;
     id<MTLBuffer> u_gqa;
+    id<MTLBuffer> q8_scales_in;
+    id<MTLBuffer> q8_qs_in;
+    id<MTLBuffer> q8_scales_o;
+    id<MTLBuffer> q8_qs_o;
+    id<MTLBuffer> u_nblk_in;
+    id<MTLBuffer> u_nblk_o;
 
     LayerBufs *layers;
     int n_layers;
@@ -306,11 +393,14 @@ static int compile_pipelines(MetalAttnCtx *ctx, NSError **err) {
     if (!lib) return -1;
     ctx->p_matvec_f16 = retain_obj(make_pso(ctx->device, lib, @"matvec_f16", err));
     ctx->p_matvec_q4k = retain_obj(make_pso(ctx->device, lib, @"matvec_q4k", err));
+    ctx->p_matvec_q4k_q8 = retain_obj(make_pso(ctx->device, lib, @"matvec_q4k_q8", err));
+    ctx->p_quantize_q8 = retain_obj(make_pso(ctx->device, lib, @"quantize_q8", err));
     ctx->p_rms = retain_obj(make_pso(ctx->device, lib, @"rms_norm_heads", err));
     ctx->p_rope = retain_obj(make_pso(ctx->device, lib, @"rope_inplace", err));
     ctx->p_kv_append = retain_obj(make_pso(ctx->device, lib, @"kv_append", err));
     ctx->p_gqa = retain_obj(make_pso(ctx->device, lib, @"gqa_attn", err));
-    if (!ctx->p_matvec_f16 || !ctx->p_matvec_q4k || !ctx->p_rms || !ctx->p_rope ||
+    if (!ctx->p_matvec_f16 || !ctx->p_matvec_q4k || !ctx->p_matvec_q4k_q8 ||
+        !ctx->p_quantize_q8 || !ctx->p_rms || !ctx->p_rope ||
         !ctx->p_kv_append || !ctx->p_gqa)
         return -2;
     return 0;
@@ -350,10 +440,10 @@ int tg_metal_available(void) {
                      err ? [[err localizedDescription] UTF8String] : "?");
             return 0;
         }
-        id<MTLFunction> fn = [lib newFunctionWithName:@"matvec_q4k"];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"matvec_q4k_q8"];
         if (!fn) {
             g_available = 0;
-            snprintf(g_status, sizeof(g_status), "Metal shader missing matvec_q4k");
+            snprintf(g_status, sizeof(g_status), "Metal shader missing matvec_q4k_q8");
             return 0;
         }
         id<MTLComputePipelineState> pso =
@@ -443,6 +533,18 @@ void *tg_metal_create(int n_layers, int embed_dim, int n_heads, int n_kv_heads,
         ctx->u_kv_len = buf_len(ctx->device, 4);
         ctx->u_seq = buf_len(ctx->device, 4);
 
+        /* Q8 scratch for Q4×Q8 matvec path (embed and q_dim must be % 256 == 0). */
+        if ((embed_dim % 256) == 0 && (ctx->q_dim % 256) == 0) {
+            uint32_t nblk_in = (uint32_t)(embed_dim / 256);
+            uint32_t nblk_o = (uint32_t)(ctx->q_dim / 256);
+            ctx->u_nblk_in = buf_bytes(ctx->device, &nblk_in, 4);
+            ctx->u_nblk_o = buf_bytes(ctx->device, &nblk_o, 4);
+            ctx->q8_scales_in = buf_len(ctx->device, (size_t)nblk_in * sizeof(float));
+            ctx->q8_qs_in = buf_len(ctx->device, (size_t)nblk_in * 256);
+            ctx->q8_scales_o = buf_len(ctx->device, (size_t)nblk_o * sizeof(float));
+            ctx->q8_qs_o = buf_len(ctx->device, (size_t)nblk_o * 256);
+        }
+
         for (int i = 0; i < n_layers; i++) {
             size_t kv_bytes = (size_t)n_kv_heads * (size_t)kv_max * (size_t)head_dim * f;
             ctx->layers[i].kv_k = buf_len(ctx->device, kv_bytes);
@@ -486,6 +588,8 @@ void tg_metal_destroy(void *ctx_v) {
         }
         release_obj(ctx->p_matvec_f16);
         release_obj(ctx->p_matvec_q4k);
+        release_obj(ctx->p_matvec_q4k_q8);
+        release_obj(ctx->p_quantize_q8);
         release_obj(ctx->p_rms);
         release_obj(ctx->p_rope);
         release_obj(ctx->p_kv_append);
@@ -510,6 +614,12 @@ void tg_metal_destroy(void *ctx_v) {
         release_obj(ctx->u_kv_len);
         release_obj(ctx->u_seq);
         release_obj(ctx->u_gqa);
+        release_obj(ctx->q8_scales_in);
+        release_obj(ctx->q8_qs_in);
+        release_obj(ctx->q8_scales_o);
+        release_obj(ctx->q8_qs_o);
+        release_obj(ctx->u_nblk_in);
+        release_obj(ctx->u_nblk_o);
         release_obj(ctx->queue);
         release_obj(ctx->device);
     }
@@ -657,23 +767,47 @@ int tg_metal_attention_decode(void *ctx_v, int layer, const float *input,
 
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        id<MTLComputePipelineState> p_q = (L->mode == LAYER_MODE_Q4)
-            ? ctx->p_matvec_q4k : ctx->p_matvec_f16;
-        id<MTLComputePipelineState> p_o = p_q;
+        int use_q8 = (L->mode == LAYER_MODE_Q4) && ctx->q8_qs_in && ctx->p_matvec_q4k_q8;
 
-        /* Q */
-        [enc setBuffer:L->wq offset:0 atIndex:0];
-        [enc setBuffer:ctx->input offset:0 atIndex:1];
-        [enc setBuffer:ctx->q offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_q offset:0 atIndex:3];
-        dispatch_1d(enc, p_q, (NSUInteger)ctx->q_dim);
+        if (use_q8) {
+            /* Quantize layer input → Q8 once for Q/K (V stays F16). */
+            [enc setBuffer:ctx->input offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_nblk_in offset:0 atIndex:3];
+            dispatch_1d(enc, ctx->p_quantize_q8, (NSUInteger)(ctx->embed_dim / 256));
+            barrier_bufs(enc);
 
-        /* K */
-        [enc setBuffer:L->wk offset:0 atIndex:0];
-        [enc setBuffer:ctx->input offset:0 atIndex:1];
-        [enc setBuffer:ctx->k offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:3];
-        dispatch_1d(enc, p_q, (NSUInteger)ctx->kv_dim);
+            /* Q */
+            [enc setBuffer:L->wq offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->q offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_q offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->q_dim);
+
+            /* K */
+            [enc setBuffer:L->wk offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->k offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->kv_dim);
+        } else {
+            id<MTLComputePipelineState> p_q = (L->mode == LAYER_MODE_Q4)
+                ? ctx->p_matvec_q4k : ctx->p_matvec_f16;
+            [enc setBuffer:L->wq offset:0 atIndex:0];
+            [enc setBuffer:ctx->input offset:0 atIndex:1];
+            [enc setBuffer:ctx->q offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_q offset:0 atIndex:3];
+            dispatch_1d(enc, p_q, (NSUInteger)ctx->q_dim);
+
+            [enc setBuffer:L->wk offset:0 atIndex:0];
+            [enc setBuffer:ctx->input offset:0 atIndex:1];
+            [enc setBuffer:ctx->k offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:3];
+            dispatch_1d(enc, p_q, (NSUInteger)ctx->kv_dim);
+        }
 
         /* V always FP16 */
         [enc setBuffer:L->wv offset:0 atIndex:0];
@@ -735,11 +869,28 @@ int tg_metal_attention_decode(void *ctx_v, int layer, const float *input,
         barrier_bufs(enc);
 
         /* O */
-        [enc setBuffer:L->wo offset:0 atIndex:0];
-        [enc setBuffer:ctx->attn_out offset:0 atIndex:1];
-        [enc setBuffer:ctx->output offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_o offset:0 atIndex:3];
-        dispatch_1d(enc, p_o, (NSUInteger)ctx->embed_dim);
+        if (use_q8) {
+            [enc setBuffer:ctx->attn_out offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_o offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_o offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_nblk_o offset:0 atIndex:3];
+            dispatch_1d(enc, ctx->p_quantize_q8, (NSUInteger)(ctx->q_dim / 256));
+            barrier_bufs(enc);
+            [enc setBuffer:L->wo offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_o offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_o offset:0 atIndex:2];
+            [enc setBuffer:ctx->output offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_o offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->embed_dim);
+        } else {
+            id<MTLComputePipelineState> p_o = (L->mode == LAYER_MODE_Q4)
+                ? ctx->p_matvec_q4k : ctx->p_matvec_f16;
+            [enc setBuffer:L->wo offset:0 atIndex:0];
+            [enc setBuffer:ctx->attn_out offset:0 atIndex:1];
+            [enc setBuffer:ctx->output offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_o offset:0 atIndex:3];
+            dispatch_1d(enc, p_o, (NSUInteger)ctx->embed_dim);
+        }
 
         [enc endEncoding];
         [cb commit];

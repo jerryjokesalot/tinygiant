@@ -30,6 +30,21 @@ Prior bake-off on **Apple M3, 16GB**, same model (`Qwen3-30B-A3B-Q4_K_M`), cold 
 
 Those are **sustained generation** numbers, not a warm microbenchmark. A fresh fair bake-off (same machine, same model, same prompts) is planned for the MVP; do not treat the table above as a new claim.
 
+### Pinning A/B (M1 16GB, 2026-10-24)
+
+Same machine / model / prompts; wall-clock `NWSEngine.generate()` tok/s including prefill (60 decode tokens). Method + raw numbers: [`experiments/pinning_ab_results.json`](experiments/pinning_ab_results.json).
+
+| Task | Uniform pin48 | Non-uniform | Delta |
+|------|--------------:|------------:|------:|
+| coding | 1.70 | 1.89 | +11.4% |
+| reasoning | 1.37 | 1.44 | +5.5% |
+| creative | 2.19 | 2.39 | +9.0% |
+| math | 1.44 | 1.51 | +5.4% |
+| factual | 2.80 | 3.01 | +7.6% |
+| **average** | **1.90** | **2.05** | **+8.0%** |
+
+Shipped default is non-uniform when the profile exists. These are **not** the warm ~25.9 tok/s compute ceiling.
+
 ### Warm compute ceiling (not chat)
 
 Microbenchmarks of the fused Q4×Q8 / Q8+vdot kernel on Apple Silicon can hit **~25.9 tok/s** when experts are already warm in RAM and I/O is zero. That is a **compute ceiling**, not sustained chat speed. Sustained chat is I/O- and pin-hit-rate limited; see the M3 table above.
@@ -59,6 +74,8 @@ Contiguous:           [expert 0: gate|up|down][expert 1: gate|up|down]...
 ### 2. Text-calibrated mlock pinning
 
 Random activation profiles are near chance. A short calibration pass over real text finds the hot experts per layer; TinyGiant then `mlock`s them so the OS cannot reclaim the warm set under memory pressure.
+
+**Default pin policy:** when a concentration profile is available (`tinygiant/suggested_pins.json`, or `experiments/layer_concentration_results.json`), TinyGiant uses **non-uniform** (entropy-weighted) pinning via `ExpertCache.pin_nonuniform` — same total budget as uniform `pin48` (2304 experts), more pins on high-entropy layers. Without a profile, it falls back to uniform pin48. On Apple M1 16GB (2026-10-24), non-uniform averaged **+8.0%** wall-clock `generate()` tok/s vs uniform across 5 tasks (includes prefill; see [`experiments/pinning_ab_results.json`](experiments/pinning_ab_results.json)).
 
 ### 3. Fused Q4 matmul (implementation detail, not the novelty claim)
 
@@ -193,7 +210,7 @@ tinygiant/
 - [x] **End-to-end fused Q4 path** (`NWSEngine._forward_c` + `csrc/libtinygiant.c`)
 - [x] Packaged install (`pip install -e .`, `tinygiant` / `tinygiant-setup` / `tinygiant-server`)
 - [x] File llama.cpp RFC ([Discussion #27149](https://github.com/ggml-org/llama.cpp/discussions/27149))
-- [ ] Pinning A/B shipped with result JSON (uniform vs `pin_nonuniform`)
+- [x] Pinning A/B shipped with result JSON; non-uniform default when profile exists (+8% avg wall tok/s on M1 16GB)
 - [ ] Fair bake-off refresh vs llama.cpp CPU (same machine / model / prompts)
 - [ ] Multi-platform hardening (Linux, Windows, varied SSDs)
 - [ ] llama.cpp integration (CPU offload path)

@@ -4,6 +4,7 @@ __pycache__/
 *.json
 !service/*.json
 !experiments/*_results.json
+!tinygiant/suggested_pins.json
 .DS_Store
 
 # Build artifacts

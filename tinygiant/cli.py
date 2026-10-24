@@ -28,7 +28,7 @@ def cmd_generate():
         description="TinyGiant — MoE inference on consumer hardware")
     parser.add_argument("--model", required=True, help="Path to GGUF model")
     parser.add_argument("--cache", required=True, help="Path to NWS expert cache")
-    parser.add_argument("--pin", type=int, default=48, help="Pin top-N experts/layer (default: 48)")
+    parser.add_argument("--pin", type=int, default=48, help="Pin budget as N experts/layer average (default: 48; non-uniform when concentration profile exists)")
     parser.add_argument("--calibrate", type=int, default=10, help="Calibration tokens (default: 10)")
     parser.add_argument("--tokens", type=int, default=128, help="Tokens to generate (default: 128)")
     parser.add_argument("--prompt", type=str,

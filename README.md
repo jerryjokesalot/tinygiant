@@ -1,6 +1,6 @@
 # TinyGiant
 
-**Tiny footprint. Giant model.** Run 30B+ parameter MoE models on a laptop with 8–16GB RAM and a standard SSD. No GPU required for the CPU path.
+**Tiny footprint. Giant model.** Run 30B+ parameter MoE models on a laptop with 8–16GB RAM and a standard SSD. No GPU required for the CPU path. A **hybrid** profile (Metal attention+KV; experts stay CPU+SSD+pin) is scaffolded but **not linked yet** — do not expect GPU tok/s gains until a dated bake-off says otherwise.
 
 Large AI models are locked behind expensive hardware. A 30B model needs 18GB+ RAM just to load — more than most laptops have. TinyGiant streams only the experts the model actually uses from SSD, keeping dormant weights on disk.
 
@@ -138,6 +138,17 @@ tinygiant-setup \
   --format q4
 ```
 
+Setup also probes hardware and writes `profile.json` next to the cache
+(`cpu-only` / `hybrid` / `gpu-heavy`). **Selected defaults to `cpu-only`** until
+Metal attention+KV is linked and beats CPU TinyGiant in a bake-off. On Apple
+Silicon the probe may *recommend* `hybrid` while still selecting `cpu-only`.
+Never auto-selects `gpu-heavy` on ≤16 GiB RAM. Override anytime:
+
+```bash
+tinygiant --model … --cache … --profile hybrid   # fail-opens to CPU if Metal attn not linked
+tinygiant-server --model … --cache … --profile cpu-only
+```
+
 ### 4. First chat (CLI)
 
 `--pin 48` is the total expert budget (48 × 48 layers = 2304). With the shipped concentration profile, TinyGiant allocates that budget **non-uniformly** (entropy-weighted); without a profile it falls back to uniform pin48.
@@ -164,7 +175,7 @@ tinygiant-server \
 
 | Command | Role |
 |---------|------|
-| `tinygiant-setup` | One-shot relayout → expert cache |
+| `tinygiant-setup` | One-shot relayout → expert cache + hardware `profile.json` |
 | `tinygiant-relayout` | Same relayout, lower-level CLI |
 | `tinygiant` | Generate text (NWSEngine + libtinygiant) |
 | `tinygiant-server` | OpenAI-compatible HTTP server |
@@ -183,6 +194,9 @@ tinygiant/
 ├── tinygiant/                 # Installable package
 │   ├── cli.py                 # tinygiant / tinygiant-setup / tinygiant-relayout
 │   ├── engine.py              # NWSEngine (Python + _forward_c → libtinygiant)
+│   ├── probe.py               # Hardware probe (Metal/RAM/CUDA/SSD class)
+│   ├── profile.py             # cpu-only / hybrid / gpu-heavy selection
+│   ├── attention.py           # AttentionBackend protocol (CPU + Metal stub)
 │   ├── relayout.py            # Contiguous expert cache builder
 │   ├── server.py              # tinygiant-server
 │   └── cache.py               # Expert cache + pinning helpers

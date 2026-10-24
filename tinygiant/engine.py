@@ -86,11 +86,17 @@ def _scale_pins(pins, total_budget, n_layers):
 
 class NWSEngine:
 
-    def __init__(self, model_path, cache_dir, lib_path=None):
+    def __init__(self, model_path, cache_dir, lib_path=None, profile="cpu-only"):
         print("TinyGiant Inference Engine")
         print("=" * 60)
 
         t_start = time.perf_counter()
+
+        # Device / attention profile (Slice A scaffolding). Experts stay CPU+SSD.
+        from .attention import resolve_attention_backend
+        self.profile = (profile or "cpu-only").strip().lower().replace("_", "-")
+        self.attn_backend = resolve_attention_backend(self.profile)
+        print(f"Profile: {self.profile}; attention: {self.attn_backend.describe()}")
 
         # Load GGUF
         print("Loading GGUF reader...", end="", flush=True)

@@ -19,9 +19,23 @@ def _detokenize(llm, tokens):
     return llm.detokenize(tokens).decode("utf-8", errors="replace")
 
 
+def _add_profile_arg(parser):
+    parser.add_argument(
+        "--profile",
+        choices=["cpu-only", "hybrid", "gpu-heavy"],
+        default=None,
+        help=(
+            "Compute profile (default: cache profile.json, else cpu-only). "
+            "hybrid requests Metal attention+KV when linked; today fail-opens "
+            "to CPU. gpu-heavy is experimental and not auto-selected on ≤16 GiB."
+        ),
+    )
+
+
 def cmd_generate():
     from ._constants import N_LAYERS
     from .engine import NWSEngine
+    from .profile import resolve_runtime_profile
 
     parser = argparse.ArgumentParser(
         prog="tinygiant",
@@ -37,6 +51,7 @@ def cmd_generate():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
+    _add_profile_arg(parser)
     args = parser.parse_args()
 
     model_path = os.path.expanduser(args.model)
@@ -52,13 +67,17 @@ def cmd_generate():
         print("Run 'tinygiant-relayout' first.")
         sys.exit(1)
 
+    decision = resolve_runtime_profile(cache_dir, cli_profile=args.profile)
+    print(f"Profile: {decision.selected} (recommended={decision.recommended})")
+    print(f"  {decision.reason}")
+
     # Tokenize
     print(f"Prompt: {args.prompt!r}")
     tokens, llm = _tokenize(model_path, args.prompt)
     print(f"Tokens: {tokens} ({len(tokens)} tokens)")
 
     # Build engine
-    engine = NWSEngine(model_path, cache_dir)
+    engine = NWSEngine(model_path, cache_dir, profile=decision.selected)
 
     # Pin experts
     engine.pin_experts(args.pin, calibrate_tokens=args.calibrate, prompt_tokens=tokens)
@@ -82,6 +101,9 @@ def cmd_relayout():
 
 
 def cmd_setup():
+    from .probe import probe_hardware
+    from .profile import select_profile, write_profile_json
+
     parser = argparse.ArgumentParser(
         prog="tinygiant-setup",
         description="TinyGiant setup — prepare model for inference")
@@ -90,6 +112,12 @@ def cmd_setup():
     parser.add_argument("--format", choices=["f16", "q4"], default="q4",
                         help="Cache format (default: q4)")
     parser.add_argument("--verify", action="store_true", help="Verify output")
+    _add_profile_arg(parser)
+    parser.add_argument(
+        "--probe-ssd",
+        action="store_true",
+        help="Optional crude SSD sequential-read class probe (writes a temp file)",
+    )
     args = parser.parse_args()
 
     print("TinyGiant Setup")
@@ -110,5 +138,24 @@ def cmd_setup():
         sys.argv.append("--verify")
     cmd_relayout()
 
+    # Hardware probe + profile.json (Slice C)
+    print("\nProbing hardware for compute profile...")
+    facts = probe_hardware(cache_dir=args.cache, include_ssd=args.probe_ssd)
+    decision = select_profile(facts, override=args.profile)
+    path = write_profile_json(args.cache, facts, decision)
+    print(f"  OS/arch: {facts.os}/{facts.arch}")
+    print(f"  RAM: {facts.ram_gib:.1f} GiB" if facts.ram_gib else "  RAM: unknown")
+    print(f"  Metal: {facts.metal_available}" + (f" ({facts.metal_detail})" if facts.metal_detail else ""))
+    print(f"  CUDA: {facts.cuda_available}" + (f" ({facts.cuda_detail})" if facts.cuda_detail else ""))
+    if args.probe_ssd:
+        print(f"  SSD class: {facts.ssd_class}" + (
+            f" (~{facts.ssd_read_gbs} GiB/s)" if facts.ssd_read_gbs is not None else ""))
+    print(f"  Recommended: {decision.recommended}")
+    print(f"  Selected:    {decision.selected}")
+    print(f"  Reason: {decision.reason}")
+    print(f"  Wrote {path}")
+
     print("\nSetup complete! Run inference with:")
     print(f"  tinygiant --model {args.model} --cache {args.cache}")
+    print("Override profile (fail-opens to CPU if Metal attn not linked):")
+    print(f"  tinygiant --model {args.model} --cache {args.cache} --profile hybrid")

@@ -22,6 +22,16 @@ int tg_metal_upload_layer_f16(
     return -1;
 }
 
+int tg_metal_upload_layer_q4(
+    void *ctx, int layer,
+    const uint8_t *wq_q4, const uint8_t *wk_q4,
+    const uint16_t *wv_f16, const uint8_t *wo_q4,
+    const float *q_norm_w, const float *k_norm_w) {
+    (void)ctx; (void)layer; (void)wq_q4; (void)wk_q4; (void)wv_f16;
+    (void)wo_q4; (void)q_norm_w; (void)k_norm_w;
+    return -1;
+}
+
 int tg_metal_set_rope(void *ctx, const float *cos_table, const float *sin_table,
                       int max_pos) {
     (void)ctx; (void)cos_table; (void)sin_table; (void)max_pos;
@@ -35,6 +45,14 @@ int tg_metal_attention_decode(void *ctx, int layer, const float *input,
     (void)ctx; (void)layer; (void)input; (void)output; (void)pos;
     return -1;
 }
+
+void tg_metal_timing(void *ctx, double *decode_ms_sum, uint64_t *n_calls) {
+    (void)ctx;
+    if (decode_ms_sum) *decode_ms_sum = 0;
+    if (n_calls) *n_calls = 0;
+}
+
+void tg_metal_timing_reset(void *ctx) { (void)ctx; }
 
 const char *tg_metal_status(void) {
     return "Metal attn stub (not built for this platform)";

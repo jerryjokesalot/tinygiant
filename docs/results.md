@@ -6,6 +6,17 @@
 
 ---
 
+
+## Pinning A/B — uniform vs non-uniform (2026-10-24)
+
+**Hardware:** Apple M1, 16GB unified memory. **Model:** Qwen3-30B-A3B Q4_K_M + Q4 NWS cache.
+**Metric:** wall-clock `NWSEngine.generate()` tok/s (includes prefill; 60 decode tokens; 5 task prompts).
+
+Non-uniform (entropy-weighted, same 2304-expert budget) averaged **+7.95%** vs uniform pin48 (2.05 vs 1.90 tok/s). Per-task table and raw JSON: [`experiments/pinning_ab_results.json`](../experiments/pinning_ab_results.json). Concentration map: [`experiments/layer_concentration_results.json`](../experiments/layer_concentration_results.json).
+
+**Ship decision:** default to `pin_nonuniform` when a concentration profile exists; uniform pin48 otherwise. Do not confuse with the ~25.9 tok/s warm compute ceiling.
+
+---
 ## Compiled C Benchmarks (2026-08-18-19)
 
 ### Expert-Contiguous Re-Layout

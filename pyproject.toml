@@ -27,4 +27,4 @@ tinygiant-server = "tinygiant.server:cmd_serve"
 include = ["tinygiant*"]
 
 [tool.setuptools.package-data]
-tinygiant = ["*.dylib", "*.so"]
+tinygiant = ["*.dylib", "*.so", "suggested_pins.json"]

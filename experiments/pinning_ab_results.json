@@ -1,0 +1,149 @@
+{
+  "uniform": {
+    "coding": {
+      "label": "uniform-coding",
+      "tok_s": 1.70103129867262,
+      "total_time": 35.27271958300844,
+      "hits": 30720,
+      "pinned_hits": 19569,
+      "hit_rate": 0.63701171875,
+      "pinned_count": 2304
+    },
+    "reasoning": {
+      "label": "uniform-reasoning",
+      "tok_s": 1.3684317333009246,
+      "total_time": 43.845811625011265,
+      "hits": 41088,
+      "pinned_hits": 24362,
+      "hit_rate": 0.592922507788162,
+      "pinned_count": 2304
+    },
+    "creative": {
+      "label": "uniform-creative",
+      "tok_s": 2.1936744671933464,
+      "total_time": 27.351369082927704,
+      "hits": 28800,
+      "pinned_hits": 17538,
+      "hit_rate": 0.6089583333333334,
+      "pinned_count": 2304
+    },
+    "math": {
+      "label": "uniform-math",
+      "tok_s": 1.4358937989087504,
+      "total_time": 41.785820125136524,
+      "hits": 30720,
+      "pinned_hits": 18882,
+      "hit_rate": 0.6146484375,
+      "pinned_count": 2304
+    },
+    "factual": {
+      "label": "uniform-factual",
+      "tok_s": 2.7960368964471347,
+      "total_time": 21.458944292273372,
+      "hits": 29568,
+      "pinned_hits": 26409,
+      "hit_rate": 0.893161525974026,
+      "pinned_count": 2304
+    }
+  },
+  "nonuniform": {
+    "coding": {
+      "label": "nonuniform-coding",
+      "tok_s": 1.8941941679473477,
+      "total_time": 31.675738958176225,
+      "hits": 30720,
+      "pinned_hits": 19080,
+      "hit_rate": 0.62109375,
+      "pinned_count": 2304
+    },
+    "reasoning": {
+      "label": "nonuniform-reasoning",
+      "tok_s": 1.4442512676854042,
+      "total_time": 41.5440175421536,
+      "hits": 41088,
+      "pinned_hits": 23476,
+      "hit_rate": 0.5713590342679128,
+      "pinned_count": 2304
+    },
+    "creative": {
+      "label": "nonuniform-creative",
+      "tok_s": 2.3914735318961724,
+      "total_time": 25.089134042151272,
+      "hits": 28800,
+      "pinned_hits": 16876,
+      "hit_rate": 0.5859722222222222,
+      "pinned_count": 2304
+    },
+    "math": {
+      "label": "nonuniform-math",
+      "tok_s": 1.513082072922447,
+      "total_time": 39.65416091680527,
+      "hits": 30720,
+      "pinned_hits": 18563,
+      "hit_rate": 0.6042643229166667,
+      "pinned_count": 2304
+    },
+    "factual": {
+      "label": "nonuniform-factual",
+      "tok_s": 3.0073446373911716,
+      "total_time": 19.95115533284843,
+      "hits": 29568,
+      "pinned_hits": 25984,
+      "hit_rate": 0.8787878787878788,
+      "pinned_count": 2304
+    }
+  },
+  "suggested_pins": {
+    "0": 92,
+    "1": 85,
+    "2": 64,
+    "3": 64,
+    "4": 58,
+    "5": 57,
+    "6": 15,
+    "7": 17,
+    "8": 39,
+    "9": 31,
+    "10": 61,
+    "11": 63,
+    "12": 58,
+    "13": 64,
+    "14": 46,
+    "15": 42,
+    "16": 47,
+    "17": 52,
+    "18": 14,
+    "19": 20,
+    "20": 37,
+    "21": 32,
+    "22": 58,
+    "23": 64,
+    "24": 56,
+    "25": 58,
+    "26": 46,
+    "27": 43,
+    "28": 49,
+    "29": 47,
+    "30": 14,
+    "31": 16,
+    "32": 37,
+    "33": 32,
+    "34": 59,
+    "35": 63,
+    "36": 58,
+    "37": 63,
+    "38": 51,
+    "39": 48,
+    "40": 49,
+    "41": 58,
+    "42": 56,
+    "43": 40,
+    "44": 42,
+    "45": 28,
+    "46": 46,
+    "47": 65
+  },
+  "avg_uniform_toks": 1.8990136389045553,
+  "avg_nonuniform_toks": 2.0500691355685086,
+  "delta_pct": 7.954418734511538
+}

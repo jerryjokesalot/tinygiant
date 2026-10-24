@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 from gguf import GGUFReader
@@ -18,6 +19,69 @@ from .cache import ExpertCache
 
 def _dequant(tensor):
     return gguf_dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
+
+
+def _load_suggested_pins():
+    """Load entropy-weighted pins_per_layer if a concentration profile exists.
+
+    Search order:
+      1. TINYGIANT_CONCENTRATION_PROFILE (JSON with suggested_pins)
+      2. Package-local tinygiant/suggested_pins.json (shipped default)
+      3. experiments/layer_concentration_results.json (editable / git checkout)
+    Returns dict[int,int] or None.
+    """
+    candidates = []
+    env = os.environ.get("TINYGIANT_CONCENTRATION_PROFILE")
+    if env:
+        candidates.append(Path(os.path.expanduser(env)))
+    pkg = Path(__file__).resolve().parent
+    candidates.append(pkg / "suggested_pins.json")
+    candidates.append(pkg.parent / "experiments" / "layer_concentration_results.json")
+
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            with open(path) as f:
+                data = json.load(f)
+            pins = data.get("suggested_pins")
+            if pins:
+                return {int(k): int(v) for k, v in pins.items()}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _scale_pins(pins, total_budget, n_layers):
+    """Scale a pin map to total_budget while preserving relative weights."""
+    current = sum(pins.get(i, 0) for i in range(n_layers))
+    if current <= 0:
+        base = total_budget // n_layers
+        rem = total_budget - base * n_layers
+        return {i: base + (1 if i < rem else 0) for i in range(n_layers)}
+    if current == total_budget:
+        return {i: int(pins.get(i, 0)) for i in range(n_layers)}
+
+    scaled = {
+        i: max(0, int(round(pins.get(i, 0) * total_budget / current)))
+        for i in range(n_layers)
+    }
+    diff = total_budget - sum(scaled.values())
+    # Fix rounding on layers with the most pins first (or least if over).
+    order = sorted(range(n_layers), key=lambda i: scaled[i], reverse=(diff > 0))
+    idx = 0
+    while diff != 0 and order:
+        i = order[idx % len(order)]
+        if diff > 0:
+            scaled[i] += 1
+            diff -= 1
+        elif scaled[i] > 0:
+            scaled[i] -= 1
+            diff += 1
+        idx += 1
+        if idx > n_layers * 4:
+            break
+    return scaled
 
 
 class NWSEngine:
@@ -163,23 +227,47 @@ class NWSEngine:
     def pin_experts(self, n_per_layer, calibrate_tokens=None, prompt_tokens=None):
         """Pin hot experts into physical memory.
 
+        Default: non-uniform (entropy-weighted) pinning when a concentration
+        profile is available (package suggested_pins.json or experiments
+        results); otherwise uniform pin n_per_layer. Same total budget either
+        way (n_per_layer * N_LAYERS).
+
         If calibrate_tokens and prompt_tokens are given, runs calibration first
         and uses observed access patterns + static profile backfill.
         Otherwise uses static activation profile only.
         """
+        suggested = _load_suggested_pins()
+        total_budget = n_per_layer * N_LAYERS
+
         if calibrate_tokens and prompt_tokens:
             print(f"Calibrating ({calibrate_tokens} tokens)...", end="", flush=True)
             t0 = time.perf_counter()
             self.calibrate(prompt_tokens, n_tokens=calibrate_tokens)
             print(f" {time.perf_counter()-t0:.1f}s")
 
-            print(f"Pinning top-{n_per_layer} experts/layer from usage...", end="", flush=True)
             t0 = time.perf_counter()
-            count = self.expert_cache.pin_from_usage(n_per_layer, N_LAYERS)
+            if suggested:
+                pins = _scale_pins(suggested, total_budget, N_LAYERS)
+                lo, hi = min(pins.values()), max(pins.values())
+                print(f"Pinning non-uniform ({lo}-{hi}/layer, budget {total_budget})...",
+                      end="", flush=True)
+                count = self.expert_cache.pin_nonuniform(pins, N_LAYERS)
+            else:
+                print(f"Pinning top-{n_per_layer} experts/layer from usage...",
+                      end="", flush=True)
+                count = self.expert_cache.pin_from_usage(n_per_layer, N_LAYERS)
         else:
-            print(f"Pinning top-{n_per_layer} experts/layer (static profile)...", end="", flush=True)
             t0 = time.perf_counter()
-            count = self.expert_cache.pin_hot_experts(n_per_layer)
+            if suggested:
+                pins = _scale_pins(suggested, total_budget, N_LAYERS)
+                lo, hi = min(pins.values()), max(pins.values())
+                print(f"Pinning non-uniform ({lo}-{hi}/layer, static, budget {total_budget})...",
+                      end="", flush=True)
+                count = self.expert_cache.pin_nonuniform(pins, N_LAYERS)
+            else:
+                print(f"Pinning top-{n_per_layer} experts/layer (static profile)...",
+                      end="", flush=True)
+                count = self.expert_cache.pin_hot_experts(n_per_layer)
 
         pin_gb = count * 2.7 / 1024
         print(f" {count} experts ({pin_gb:.1f} GB) in {time.perf_counter()-t0:.1f}s")

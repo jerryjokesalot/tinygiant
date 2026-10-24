@@ -59,15 +59,15 @@ kernel void rope_inplace(
     constant uint      &pos  [[buffer(4)]],
     uint head [[thread_position_in_grid]])
 {
-    uint half = hd / 2u;
+    uint hd2 = hd / 2u;
     device float *xh = x + (size_t)head * hd;
-    device const float *c = cosv + (size_t)pos * half;
-    device const float *s = sinv + (size_t)pos * half;
-    for (uint i = 0; i < half; ++i) {
+    device const float *c = cosv + (size_t)pos * hd2;
+    device const float *s = sinv + (size_t)pos * hd2;
+    for (uint i = 0; i < hd2; ++i) {
         float x1 = xh[i];
-        float x2 = xh[half + i];
+        float x2 = xh[hd2 + i];
         xh[i]        = x1 * c[i] - x2 * s[i];
-        xh[half + i] = x2 * c[i] + x1 * s[i];
+        xh[hd2 + i] = x2 * c[i] + x1 * s[i];
     }
 }
 

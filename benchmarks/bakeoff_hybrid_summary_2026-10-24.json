@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-24",
+  "machine": "MacBook-Pro Apple M1 16GB",
+  "tinygiant_commit": "b317b01",
+  "primary_decode_tok_s": {
+    "cpu_only": {
+      "mean": 2.696728792064434,
+      "std": 0.8100089537790226,
+      "n": 15
+    },
+    "hybrid_metal_attn": {
+      "mean": 0.9134508738969151,
+      "std": 0.2351677365152657,
+      "n": 15,
+      "metal_used_all": true
+    }
+  },
+  "speedup_hybrid_vs_cpu": 0.33872552426662034,
+  "hybrid_clear_win_gt_5pct": false,
+  "recommend_flip_HYBRID_ATTN_READY": false,
+  "verdict": "Hybrid Metal attn+KV is slower than cpu-only on M1 16GB; do not flip HYBRID_ATTN_READY"
+}

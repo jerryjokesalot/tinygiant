@@ -1,0 +1,158 @@
+TinyGiant hybrid vs cpu-only bake-off
+model=/Users/jerrybecker/models/Qwen3-30B-A3B-Q4_K_M.gguf
+cache=/tmp/nws_q4_cache_v2
+n_gen=128 reps=3 pin=48
+commit=6cb9a14
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow
+  tokenize coding: 21 tokens
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow
+  tokenize reasoning: 48 tokens
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow
+  tokenize creative: 16 tokens
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow
+  tokenize math: 21 tokens
+llama_context: n_batch is less than GGML_KQ_MASK_PAD - increasing to 64
+llama_context: n_ctx_per_seq (32) > n_ctx_train (0) -- possible training context overflow
+  tokenize factual: 18 tokens
+
+======================================================================
+CONFIG: profile=cpu-only
+======================================================================
+TinyGiant Inference Engine
+============================================================
+Profile: cpu-only; attention: CPU (libtinygiant NEON/AVX / NumPy fallback)
+Loading GGUF reader... 3.2s
+NWS cache: 48 layers [Q4 (fused)]
+  libtinygiant: loaded (fused Q4xQ8 kernel)
+Loading embeddings... 2.1s (1187 MB)
+Loading output head... 2.1s (1187 MB)
+Loading norms and routers... 0.1s
+Loading attention weights... 1.1s (555 MB)
+  Attention weights: mlock'd (555 MB)
+
+Engine ready in 8.7s
+  use_metal_attn=False attn=CPU (libtinygiant NEON/AVX / NumPy fallback)
+Pinning non-uniform (14-92/layer, static, budget 2304)... 2304 experts (6.1 GB) in 1.5s
+Pinned 2304 experts for profile=cpu-only
+
+--- cpu-only / coding / rep 1 ---
+  decode=2.266 tok/s  wall=2.016  metal=False  hit_rate=0.494
+
+--- cpu-only / coding / rep 2 ---
+  decode=2.450 tok/s  wall=2.171  metal=False  hit_rate=0.510
+
+--- cpu-only / coding / rep 3 ---
+  decode=2.640 tok/s  wall=2.305  metal=False  hit_rate=0.530
+
+--- cpu-only / reasoning / rep 1 ---
+  decode=3.603 tok/s  wall=2.559  metal=False  hit_rate=0.591
+
+--- cpu-only / reasoning / rep 2 ---
+  decode=3.369 tok/s  wall=2.437  metal=False  hit_rate=0.581
+
+--- cpu-only / reasoning / rep 3 ---
+  decode=3.660 tok/s  wall=2.603  metal=False  hit_rate=0.594
+
+--- cpu-only / creative / rep 1 ---
+  decode=3.206 tok/s  wall=2.783  metal=False  hit_rate=0.611
+
+--- cpu-only / creative / rep 2 ---
+  decode=3.221 tok/s  wall=2.788  metal=False  hit_rate=0.480
+
+--- cpu-only / creative / rep 3 ---
+  decode=4.068 tok/s  wall=3.421  metal=False  hit_rate=0.585
+
+--- cpu-only / math / rep 1 ---
+  decode=1.993 tok/s  wall=1.717  metal=False  hit_rate=0.528
+
+--- cpu-only / math / rep 2 ---
+  decode=1.846 tok/s  wall=1.619  metal=False  hit_rate=0.516
+
+--- cpu-only / math / rep 3 ---
+  decode=1.537 tok/s  wall=1.344  metal=False  hit_rate=0.484
+
+--- cpu-only / factual / rep 1 ---
+  decode=3.757 tok/s  wall=3.267  metal=False  hit_rate=0.846
+
+--- cpu-only / factual / rep 2 ---
+  decode=3.965 tok/s  wall=3.430  metal=False  hit_rate=0.859
+
+--- cpu-only / factual / rep 3 ---
+  decode=3.506 tok/s  wall=3.093  metal=False  hit_rate=0.826
+
+======================================================================
+CONFIG: profile=hybrid
+======================================================================
+TinyGiant Inference Engine
+============================================================
+Profile: hybrid; attention: Metal attention+KV (experimental) — Metal attn ready (Apple M1, Q4+F16)
+Loading GGUF reader... 3.2s
+NWS cache: 48 layers [Q4 (fused)]
+  libtinygiant: loaded (fused Q4xQ8 kernel)
+Loading embeddings... 2.2s (1187 MB)
+Loading output head... 1.7s (1187 MB)
+Loading norms and routers... 0.1s
+Loading attention weights... 1.2s (555 MB)
+  Metal attention: uploading Q4_K Q/K/O + FP16 V (migrate off host)... OK in 0.2s (555 MB Q4_K Q/K/O + FP16 V on Metal, host attn+KV released)
+
+Engine ready in 8.9s
+  use_metal_attn=True attn=Metal attention+KV (experimental) — Metal attn ctx (Apple M1)
+Pinning non-uniform (14-92/layer, static, budget 2304)... 2304 experts (6.1 GB) in 1.0s
+Pinned 2304 experts for profile=hybrid
+
+--- hybrid / coding / rep 1 ---
+  decode=0.914 tok/s  wall=0.851  metal=True  hit_rate=0.495
+
+--- hybrid / coding / rep 2 ---
+  decode=0.970 tok/s  wall=0.901  metal=True  hit_rate=0.514
+
+--- hybrid / coding / rep 3 ---
+  decode=1.051 tok/s  wall=0.971  metal=True  hit_rate=0.589
+
+--- hybrid / reasoning / rep 1 ---
+  decode=1.045 tok/s  wall=0.850  metal=True  hit_rate=0.580
+
+--- hybrid / reasoning / rep 2 ---
+  decode=1.153 tok/s  wall=0.927  metal=True  hit_rate=0.587
+
+--- hybrid / reasoning / rep 3 ---
+  decode=1.164 tok/s  wall=0.938  metal=True  hit_rate=0.586
+
+--- hybrid / creative / rep 1 ---
+  decode=1.337 tok/s  wall=1.227  metal=True  hit_rate=0.621
+
+--- hybrid / creative / rep 2 ---
+  decode=1.308 tok/s  wall=1.209  metal=True  hit_rate=0.484
+
+--- hybrid / creative / rep 3 ---
+  decode=1.282 tok/s  wall=1.188  metal=True  hit_rate=0.571
+
+--- hybrid / math / rep 1 ---
+  decode=0.902 tok/s  wall=0.822  metal=True  hit_rate=0.534
+
+--- hybrid / math / rep 2 ---
+  decode=0.874 tok/s  wall=0.798  metal=True  hit_rate=0.526
+
+--- hybrid / math / rep 3 ---
+  decode=0.807 tok/s  wall=0.741  metal=True  hit_rate=0.486
+
+--- hybrid / factual / rep 1 ---
+  decode=1.503 tok/s  wall=1.392  metal=True  hit_rate=0.863
+
+--- hybrid / factual / rep 2 ---
+  decode=1.527 tok/s  wall=1.414  metal=True  hit_rate=0.889
+
+--- hybrid / factual / rep 3 ---
+  decode=1.399 tok/s  wall=1.307  metal=True  hit_rate=0.824
+
+======================================================================
+SUMMARY
+  cpu-only: decode 3.006 ± 0.791 tok/s  wall 2.504 ± 0.629  metal_all=False
+  hybrid: decode 1.149 ± 0.227 tok/s  wall 1.036 ± 0.221  metal_all=True
+  hybrid/cpu speedup: 0.382x
+  clear win (>5%): False
+  wrote /tmp/tg_bakeoff/bakeoff_hybrid_raw_q4fix.json

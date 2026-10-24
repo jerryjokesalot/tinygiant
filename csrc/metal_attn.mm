@@ -1,10 +1,12 @@
 /* metal_attn.mm — Metal attention+KV for TinyGiant Slice A
  *
- * Runtime-compiled Metal shaders (no metallib / xcrun metal required).
- * FP16 weights live in MTLResourceStorageModeShared buffers (unified memory —
- * migrate off host mlock; do not mirror). KV cache lives only on Metal.
+ * Runtime-compiled Metal shaders. Prefers Q4_K Q/K/O (+ FP16 V) to avoid the
+ * ~4x bandwidth tax of FP16 expand vs the CPU NEON Q4 path. FP16 upload
+ * remains for non-Q4 models / tests.
  *
- * Semantics match tg_attention_decode (GQA, QK-RMS, RoPE, softmax).
+ * Semantics match tg_attention_decode / tg_attention_decode_q4 (GQA, QK-RMS,
+ * RoPE, softmax). One command-buffer commit + wait per layer (MoE on CPU
+ * forces a sync between layers — structural).
  */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -12,15 +14,20 @@
 
 #include "metal_attn.h"
 
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#define TG_QK_K 256
+#define TG_Q4K_BSIZE 144
+
 static const char *kShaderSrc = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 
+/* ---- Fast FP16 matvec: one thread per output row, half4 SIMD ---- */
 kernel void matvec_f16(
     device const half  *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
@@ -30,9 +37,142 @@ kernel void matvec_f16(
 {
     device const half *rowW = W + ((size_t)row * (size_t)cols);
     float sum = 0.0f;
-    for (uint j = 0; j < cols; ++j)
+    uint j = 0;
+    for (; j + 4u <= cols; j += 4u) {
+        float4 xv = float4(x[j], x[j+1], x[j+2], x[j+3]);
+        float4 wv = float4(rowW[j], rowW[j+1], rowW[j+2], rowW[j+3]);
+        sum += dot(wv, xv);
+    }
+    for (; j < cols; ++j)
         sum += float(rowW[j]) * x[j];
     y[row] = sum;
+}
+
+/* Q4_K helpers (matches libtinygiant). */
+inline void get_scale_min_k4(int j, device const uchar *scales,
+                             thread uchar &sc, thread uchar &m)
+{
+    if (j < 4) {
+        sc = scales[j] & 63;
+        m  = scales[j + 4] & 63;
+    } else {
+        sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        m  = (scales[j + 4] >>  4) | ((scales[j    ] >> 6) << 4);
+    }
+}
+
+/* Quantize float x into Q8 blocks: scales[b], qs[b*256 + i]. */
+kernel void quantize_q8(
+    device const float *x      [[buffer(0)]],
+    device float       *scales [[buffer(1)]],
+    device char        *qs     [[buffer(2)]],
+    constant uint      &nblk   [[buffer(3)]],
+    uint b [[thread_position_in_grid]])
+{
+    if (b >= nblk) return;
+    device const float *xb = x + b * 256u;
+    float amax = 0.0f;
+    for (uint i = 0; i < 256u; ++i) {
+        float v = fabs(xb[i]);
+        if (v > amax) amax = v;
+    }
+    float sc = amax / 127.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    scales[b] = sc;
+    device char *q = qs + b * 256u;
+    for (uint i = 0; i < 256u; ++i) {
+        int val = int(round(xb[i] * inv));
+        if (val > 127) val = 127;
+        if (val < -128) val = -128;
+        q[i] = char(val);
+    }
+}
+
+/* Q4_K × Q8 matvec — integer path matching CPU NEON hot loop. */
+kernel void matvec_q4k_q8(
+    device const uchar *W      [[buffer(0)]],
+    device const float *xscale [[buffer(1)]],
+    device const char  *xqs    [[buffer(2)]],
+    device float       *y      [[buffer(3)]],
+    constant uint      &cols   [[buffer(4)]],
+    uint row [[thread_position_in_grid]])
+{
+    uint bpr = cols / 256u;
+    device const uchar *rowW = W + ((size_t)row * (size_t)bpr * 144u);
+    float total = 0.0f;
+    for (uint b = 0; b < bpr; ++b) {
+        device const uchar *bl = rowW + b * 144u;
+        device const half *h = (device const half *)bl;
+        float d = float(h[0]);
+        float dmin = float(h[1]);
+        device const uchar *scales = bl + 4;
+        device const uchar *qs = bl + 16;
+        device const char *xq = xqs + b * 256u;
+        float sx = xscale[b];
+        float block_sum = 0.0f;
+        for (uint g = 0; g < 4u; ++g) {
+            uchar sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(int(2u * g),     scales, sc_lo, m_lo);
+            get_scale_min_k4(int(2u * g + 1), scales, sc_hi, m_hi);
+            device const uchar *qs_g = qs + g * 32u;
+            device const char *xq_lo = xq + g * 64u;
+            device const char *xq_hi = xq + g * 64u + 32u;
+            int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
+            for (uint j = 0; j < 32u; ++j) {
+                uchar v = qs_g[j];
+                int nib_lo = int(v & 0xFu);
+                int nib_hi = int(v >> 4);
+                int xl = int(xq_lo[j]);
+                int xh = int(xq_hi[j]);
+                dot_lo += nib_lo * xl;
+                dot_hi += nib_hi * xh;
+                sum_lo += xl;
+                sum_hi += xh;
+            }
+            block_sum += d * float(sc_lo) * float(dot_lo)
+                       - dmin * float(m_lo) * float(sum_lo);
+            block_sum += d * float(sc_hi) * float(dot_hi)
+                       - dmin * float(m_hi) * float(sum_hi);
+        }
+        total += sx * block_sum;
+    }
+    y[row] = total;
+}
+
+/* Fallback Q4_K × float (tests / non-Q8 path). */
+kernel void matvec_q4k(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint row [[thread_position_in_grid]])
+{
+    uint bpr = cols / 256u;
+    device const uchar *rowW = W + ((size_t)row * (size_t)bpr * 144u);
+    float total = 0.0f;
+    for (uint b = 0; b < bpr; ++b) {
+        device const uchar *bl = rowW + b * 144u;
+        device const half *h = (device const half *)bl;
+        float d = float(h[0]);
+        float dmin = float(h[1]);
+        device const uchar *scales = bl + 4;
+        device const uchar *qs = bl + 16;
+        device const float *xb = x + b * 256u;
+        for (uint g = 0; g < 4u; ++g) {
+            uchar sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(int(2u * g),     scales, sc_lo, m_lo);
+            get_scale_min_k4(int(2u * g + 1), scales, sc_hi, m_hi);
+            device const uchar *qs_g = qs + g * 32u;
+            for (uint j = 0; j < 32u; ++j) {
+                uchar v = qs_g[j];
+                float val_lo = d * float(sc_lo) * float(v & 0xFu) - dmin * float(m_lo);
+                float val_hi = d * float(sc_hi) * float(v >> 4)   - dmin * float(m_hi);
+                total += val_lo * xb[g * 64u + j]
+                       + val_hi * xb[g * 64u + 32u + j];
+            }
+        }
+    }
+    y[row] = total;
 }
 
 kernel void rms_norm_heads(
@@ -107,36 +247,35 @@ kernel void gqa_attn(
     device float *oh = out + (size_t)head * hd;
 
     float inv_sqrt = rsqrt(float(hd));
-    // Find max score (online) — seq_len is small-to-medium for decode.
     float max_score = -1e30f;
-    // Cap stack-ish scores via iterative two-pass without dynamic alloc:
-    // Pass 1: max; Pass 2: softmax sum; Pass 3: weighted V.
     for (uint t = 0; t < seq_len; ++t) {
         device const float *kt = kc + (size_t)t * hd;
-        float dot = 0.0f;
-        for (uint i = 0; i < hd; ++i) dot += qh[i] * kt[i];
-        float sc = dot * inv_sqrt;
+        float dotv = 0.0f;
+        for (uint i = 0; i < hd; ++i) dotv += qh[i] * kt[i];
+        float sc = dotv * inv_sqrt;
         if (sc > max_score) max_score = sc;
     }
     float sum_exp = 0.0f;
     for (uint t = 0; t < seq_len; ++t) {
         device const float *kt = kc + (size_t)t * hd;
-        float dot = 0.0f;
-        for (uint i = 0; i < hd; ++i) dot += qh[i] * kt[i];
-        sum_exp += exp(dot * inv_sqrt - max_score);
+        float dotv = 0.0f;
+        for (uint i = 0; i < hd; ++i) dotv += qh[i] * kt[i];
+        sum_exp += exp(dotv * inv_sqrt - max_score);
     }
     float inv_sum = 1.0f / sum_exp;
     for (uint i = 0; i < hd; ++i) oh[i] = 0.0f;
     for (uint t = 0; t < seq_len; ++t) {
         device const float *kt = kc + (size_t)t * hd;
         device const float *vt = vc + (size_t)t * hd;
-        float dot = 0.0f;
-        for (uint i = 0; i < hd; ++i) dot += qh[i] * kt[i];
-        float w = exp(dot * inv_sqrt - max_score) * inv_sum;
+        float dotv = 0.0f;
+        for (uint i = 0; i < hd; ++i) dotv += qh[i] * kt[i];
+        float w = exp(dotv * inv_sqrt - max_score) * inv_sum;
         for (uint i = 0; i < hd; ++i) oh[i] += w * vt[i];
     }
 }
 )METAL";
+
+enum LayerWeightMode { LAYER_MODE_NONE = 0, LAYER_MODE_F16 = 1, LAYER_MODE_Q4 = 2 };
 
 struct LayerBufs {
     id<MTLBuffer> wq;
@@ -147,13 +286,16 @@ struct LayerBufs {
     id<MTLBuffer> k_norm;
     id<MTLBuffer> kv_k;
     id<MTLBuffer> kv_v;
-    int uploaded;
+    int mode; /* LayerWeightMode */
 };
 
 struct MetalAttnCtx {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLComputePipelineState> p_matvec;
+    id<MTLComputePipelineState> p_matvec_f16;
+    id<MTLComputePipelineState> p_matvec_q4k;
+    id<MTLComputePipelineState> p_matvec_q4k_q8;
+    id<MTLComputePipelineState> p_quantize_q8;
     id<MTLComputePipelineState> p_rms;
     id<MTLComputePipelineState> p_rope;
     id<MTLComputePipelineState> p_kv_append;
@@ -179,6 +321,12 @@ struct MetalAttnCtx {
     id<MTLBuffer> u_kv_len;
     id<MTLBuffer> u_seq;
     id<MTLBuffer> u_gqa;
+    id<MTLBuffer> q8_scales_in;
+    id<MTLBuffer> q8_qs_in;
+    id<MTLBuffer> q8_scales_o;
+    id<MTLBuffer> q8_qs_o;
+    id<MTLBuffer> u_nblk_in;
+    id<MTLBuffer> u_nblk_o;
 
     LayerBufs *layers;
     int n_layers;
@@ -191,12 +339,26 @@ struct MetalAttnCtx {
     int kv_dim;
     int gqa_ratio;
     int rope_max_pos;
-    int kv_len; /* global decode length; matches engine pos after each step */
+    int kv_len;
     char status[128];
+
+    double decode_ms_sum;
+    uint64_t decode_calls;
 };
 
-static int g_available = -1; /* -1 unknown, 0 no, 1 yes */
+static int g_available = -1;
 static char g_status[160] = "Metal attn not probed";
+static mach_timebase_info_data_t g_timebase;
+static int g_timebase_ok = 0;
+
+static double mono_ms(void) {
+    if (!g_timebase_ok) {
+        mach_timebase_info(&g_timebase);
+        g_timebase_ok = 1;
+    }
+    uint64_t t = mach_absolute_time();
+    return (double)t * (double)g_timebase.numer / (double)g_timebase.denom / 1e6;
+}
 
 static id retain_obj(id obj) {
     if (obj) CFRetain((__bridge CFTypeRef)obj);
@@ -229,12 +391,17 @@ static int compile_pipelines(MetalAttnCtx *ctx, NSError **err) {
                                                    options:nil
                                                      error:err];
     if (!lib) return -1;
-    ctx->p_matvec = retain_obj(make_pso(ctx->device, lib, @"matvec_f16", err));
+    ctx->p_matvec_f16 = retain_obj(make_pso(ctx->device, lib, @"matvec_f16", err));
+    ctx->p_matvec_q4k = retain_obj(make_pso(ctx->device, lib, @"matvec_q4k", err));
+    ctx->p_matvec_q4k_q8 = retain_obj(make_pso(ctx->device, lib, @"matvec_q4k_q8", err));
+    ctx->p_quantize_q8 = retain_obj(make_pso(ctx->device, lib, @"quantize_q8", err));
     ctx->p_rms = retain_obj(make_pso(ctx->device, lib, @"rms_norm_heads", err));
     ctx->p_rope = retain_obj(make_pso(ctx->device, lib, @"rope_inplace", err));
     ctx->p_kv_append = retain_obj(make_pso(ctx->device, lib, @"kv_append", err));
     ctx->p_gqa = retain_obj(make_pso(ctx->device, lib, @"gqa_attn", err));
-    if (!ctx->p_matvec || !ctx->p_rms || !ctx->p_rope || !ctx->p_kv_append || !ctx->p_gqa)
+    if (!ctx->p_matvec_f16 || !ctx->p_matvec_q4k || !ctx->p_matvec_q4k_q8 ||
+        !ctx->p_quantize_q8 || !ctx->p_rms || !ctx->p_rope ||
+        !ctx->p_kv_append || !ctx->p_gqa)
         return -2;
     return 0;
 }
@@ -273,10 +440,10 @@ int tg_metal_available(void) {
                      err ? [[err localizedDescription] UTF8String] : "?");
             return 0;
         }
-        id<MTLFunction> fn = [lib newFunctionWithName:@"gqa_attn"];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"matvec_q4k_q8"];
         if (!fn) {
             g_available = 0;
-            snprintf(g_status, sizeof(g_status), "Metal shader missing gqa_attn");
+            snprintf(g_status, sizeof(g_status), "Metal shader missing matvec_q4k_q8");
             return 0;
         }
         id<MTLComputePipelineState> pso =
@@ -288,7 +455,7 @@ int tg_metal_available(void) {
             return 0;
         }
         g_available = 1;
-        snprintf(g_status, sizeof(g_status), "Metal attn ready (%s)",
+        snprintf(g_status, sizeof(g_status), "Metal attn ready (%s, Q4+F16)",
                  [[dev name] UTF8String]);
         return 1;
     }
@@ -310,7 +477,7 @@ void *tg_metal_create(int n_layers, int embed_dim, int n_heads, int n_kv_heads,
     @autoreleasepool {
         MetalAttnCtx *ctx = (MetalAttnCtx *)calloc(1, sizeof(MetalAttnCtx));
         if (!ctx) return NULL;
-        ctx->device = MTLCreateSystemDefaultDevice(); /* +1 */
+        ctx->device = MTLCreateSystemDefaultDevice();
         if (!ctx->device) { free(ctx); return NULL; }
         ctx->queue = retain_obj([ctx->device newCommandQueue]);
         NSError *err = nil;
@@ -331,6 +498,8 @@ void *tg_metal_create(int n_layers, int embed_dim, int n_heads, int n_kv_heads,
         ctx->gqa_ratio = n_heads / n_kv_heads;
         ctx->kv_len = 0;
         ctx->rope_max_pos = 0;
+        ctx->decode_ms_sum = 0;
+        ctx->decode_calls = 0;
 
         ctx->layers = (LayerBufs *)calloc((size_t)n_layers, sizeof(LayerBufs));
         if (!ctx->layers) { free(ctx); return NULL; }
@@ -364,11 +533,23 @@ void *tg_metal_create(int n_layers, int embed_dim, int n_heads, int n_kv_heads,
         ctx->u_kv_len = buf_len(ctx->device, 4);
         ctx->u_seq = buf_len(ctx->device, 4);
 
+        /* Q8 scratch for Q4×Q8 matvec path (embed and q_dim must be % 256 == 0). */
+        if ((embed_dim % 256) == 0 && (ctx->q_dim % 256) == 0) {
+            uint32_t nblk_in = (uint32_t)(embed_dim / 256);
+            uint32_t nblk_o = (uint32_t)(ctx->q_dim / 256);
+            ctx->u_nblk_in = buf_bytes(ctx->device, &nblk_in, 4);
+            ctx->u_nblk_o = buf_bytes(ctx->device, &nblk_o, 4);
+            ctx->q8_scales_in = buf_len(ctx->device, (size_t)nblk_in * sizeof(float));
+            ctx->q8_qs_in = buf_len(ctx->device, (size_t)nblk_in * 256);
+            ctx->q8_scales_o = buf_len(ctx->device, (size_t)nblk_o * sizeof(float));
+            ctx->q8_qs_o = buf_len(ctx->device, (size_t)nblk_o * 256);
+        }
+
         for (int i = 0; i < n_layers; i++) {
             size_t kv_bytes = (size_t)n_kv_heads * (size_t)kv_max * (size_t)head_dim * f;
             ctx->layers[i].kv_k = buf_len(ctx->device, kv_bytes);
             ctx->layers[i].kv_v = buf_len(ctx->device, kv_bytes);
-            ctx->layers[i].uploaded = 0;
+            ctx->layers[i].mode = LAYER_MODE_NONE;
             if (!ctx->layers[i].kv_k || !ctx->layers[i].kv_v) {
                 tg_metal_destroy(ctx);
                 return NULL;
@@ -405,7 +586,10 @@ void tg_metal_destroy(void *ctx_v) {
             free(ctx->layers);
             ctx->layers = NULL;
         }
-        release_obj(ctx->p_matvec);
+        release_obj(ctx->p_matvec_f16);
+        release_obj(ctx->p_matvec_q4k);
+        release_obj(ctx->p_matvec_q4k_q8);
+        release_obj(ctx->p_quantize_q8);
         release_obj(ctx->p_rms);
         release_obj(ctx->p_rope);
         release_obj(ctx->p_kv_append);
@@ -430,10 +614,23 @@ void tg_metal_destroy(void *ctx_v) {
         release_obj(ctx->u_kv_len);
         release_obj(ctx->u_seq);
         release_obj(ctx->u_gqa);
+        release_obj(ctx->q8_scales_in);
+        release_obj(ctx->q8_qs_in);
+        release_obj(ctx->q8_scales_o);
+        release_obj(ctx->q8_qs_o);
+        release_obj(ctx->u_nblk_in);
+        release_obj(ctx->u_nblk_o);
         release_obj(ctx->queue);
         release_obj(ctx->device);
     }
     free(ctx);
+}
+
+static void release_layer_weights(LayerBufs *L) {
+    release_obj(L->wq); release_obj(L->wk); release_obj(L->wv);
+    release_obj(L->wo); release_obj(L->q_norm); release_obj(L->k_norm);
+    L->wq = L->wk = L->wv = L->wo = L->q_norm = L->k_norm = nil;
+    L->mode = LAYER_MODE_NONE;
 }
 
 int tg_metal_upload_layer_f16(
@@ -453,8 +650,7 @@ int tg_metal_upload_layer_f16(
         size_t hn = (size_t)ctx->head_dim * sizeof(float);
 
         LayerBufs *L = &ctx->layers[layer];
-        release_obj(L->wq); release_obj(L->wk); release_obj(L->wv);
-        release_obj(L->wo); release_obj(L->q_norm); release_obj(L->k_norm);
+        release_layer_weights(L);
         L->wq = buf_bytes(ctx->device, wq, q_bytes);
         L->wk = buf_bytes(ctx->device, wk, kv_bytes);
         L->wv = buf_bytes(ctx->device, wv, kv_bytes);
@@ -463,7 +659,44 @@ int tg_metal_upload_layer_f16(
         L->k_norm = buf_bytes(ctx->device, k_norm_w, hn);
         if (!L->wq || !L->wk || !L->wv || !L->wo || !L->q_norm || !L->k_norm)
             return -3;
-        L->uploaded = 1;
+        L->mode = LAYER_MODE_F16;
+        return 0;
+    }
+}
+
+int tg_metal_upload_layer_q4(
+    void *ctx_v, int layer,
+    const uint8_t *wq_q4, const uint8_t *wk_q4,
+    const uint16_t *wv_f16, const uint8_t *wo_q4,
+    const float *q_norm_w, const float *k_norm_w)
+{
+    if (!ctx_v || !wq_q4 || !wk_q4 || !wv_f16 || !wo_q4 || !q_norm_w || !k_norm_w)
+        return -1;
+    MetalAttnCtx *ctx = (MetalAttnCtx *)ctx_v;
+    if (layer < 0 || layer >= ctx->n_layers) return -2;
+    if ((ctx->embed_dim % TG_QK_K) != 0 || (ctx->q_dim % TG_QK_K) != 0)
+        return -4;
+
+    @autoreleasepool {
+        int bpr_in = ctx->embed_dim / TG_QK_K;
+        int bpr_o = ctx->q_dim / TG_QK_K;
+        size_t q_bytes = (size_t)ctx->q_dim * (size_t)bpr_in * TG_Q4K_BSIZE;
+        size_t k_bytes = (size_t)ctx->kv_dim * (size_t)bpr_in * TG_Q4K_BSIZE;
+        size_t o_bytes = (size_t)ctx->embed_dim * (size_t)bpr_o * TG_Q4K_BSIZE;
+        size_t v_bytes = (size_t)ctx->kv_dim * (size_t)ctx->embed_dim * sizeof(uint16_t);
+        size_t hn = (size_t)ctx->head_dim * sizeof(float);
+
+        LayerBufs *L = &ctx->layers[layer];
+        release_layer_weights(L);
+        L->wq = buf_bytes(ctx->device, wq_q4, q_bytes);
+        L->wk = buf_bytes(ctx->device, wk_q4, k_bytes);
+        L->wv = buf_bytes(ctx->device, wv_f16, v_bytes);
+        L->wo = buf_bytes(ctx->device, wo_q4, o_bytes);
+        L->q_norm = buf_bytes(ctx->device, q_norm_w, hn);
+        L->k_norm = buf_bytes(ctx->device, k_norm_w, hn);
+        if (!L->wq || !L->wk || !L->wv || !L->wo || !L->q_norm || !L->k_norm)
+            return -3;
+        L->mode = LAYER_MODE_Q4;
         return 0;
     }
 }
@@ -499,48 +732,89 @@ void tg_metal_reset_kv(void *ctx_v) {
     }
 }
 
+void tg_metal_timing(void *ctx_v, double *decode_ms_sum, uint64_t *n_calls) {
+    MetalAttnCtx *ctx = (MetalAttnCtx *)ctx_v;
+    if (decode_ms_sum) *decode_ms_sum = ctx ? ctx->decode_ms_sum : 0;
+    if (n_calls) *n_calls = ctx ? ctx->decode_calls : 0;
+}
+
+void tg_metal_timing_reset(void *ctx_v) {
+    if (!ctx_v) return;
+    MetalAttnCtx *ctx = (MetalAttnCtx *)ctx_v;
+    ctx->decode_ms_sum = 0;
+    ctx->decode_calls = 0;
+}
+
 int tg_metal_attention_decode(void *ctx_v, int layer, const float *input,
                               float *output, int pos) {
     if (!ctx_v || !input || !output) return -1;
     MetalAttnCtx *ctx = (MetalAttnCtx *)ctx_v;
     if (layer < 0 || layer >= ctx->n_layers) return -2;
     LayerBufs *L = &ctx->layers[layer];
-    if (!L->uploaded) return -3;
+    if (L->mode == LAYER_MODE_NONE) return -3;
     if (!ctx->rope_cos || pos < 0 || pos >= ctx->rope_max_pos) return -4;
     if (pos >= ctx->kv_max) return -5;
 
+    double t0 = mono_ms();
     @autoreleasepool {
         memcpy([ctx->input contents], input, (size_t)ctx->embed_dim * sizeof(float));
 
         uint32_t pos_u = (uint32_t)pos;
         uint32_t seq = (uint32_t)(pos + 1);
         memcpy([ctx->u_pos contents], &pos_u, 4);
-        memcpy([ctx->u_kv_len contents], &pos_u, 4); /* append at index == pos */
+        memcpy([ctx->u_kv_len contents], &pos_u, 4);
         memcpy([ctx->u_seq contents], &seq, 4);
 
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        int use_q8 = (L->mode == LAYER_MODE_Q4) && ctx->q8_qs_in && ctx->p_matvec_q4k_q8;
 
-        /* Q = Wq @ x */
-        [enc setBuffer:L->wq offset:0 atIndex:0];
-        [enc setBuffer:ctx->input offset:0 atIndex:1];
-        [enc setBuffer:ctx->q offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_q offset:0 atIndex:3];
-        dispatch_1d(enc, ctx->p_matvec, (NSUInteger)ctx->q_dim);
+        if (use_q8) {
+            /* Quantize layer input → Q8 once for Q/K (V stays F16). */
+            [enc setBuffer:ctx->input offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_nblk_in offset:0 atIndex:3];
+            dispatch_1d(enc, ctx->p_quantize_q8, (NSUInteger)(ctx->embed_dim / 256));
+            barrier_bufs(enc);
 
-        /* K */
-        [enc setBuffer:L->wk offset:0 atIndex:0];
-        [enc setBuffer:ctx->input offset:0 atIndex:1];
-        [enc setBuffer:ctx->k offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:3];
-        dispatch_1d(enc, ctx->p_matvec, (NSUInteger)ctx->kv_dim);
+            /* Q */
+            [enc setBuffer:L->wq offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->q offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_q offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->q_dim);
 
-        /* V */
+            /* K */
+            [enc setBuffer:L->wk offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_in offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_in offset:0 atIndex:2];
+            [enc setBuffer:ctx->k offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->kv_dim);
+        } else {
+            id<MTLComputePipelineState> p_q = (L->mode == LAYER_MODE_Q4)
+                ? ctx->p_matvec_q4k : ctx->p_matvec_f16;
+            [enc setBuffer:L->wq offset:0 atIndex:0];
+            [enc setBuffer:ctx->input offset:0 atIndex:1];
+            [enc setBuffer:ctx->q offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_q offset:0 atIndex:3];
+            dispatch_1d(enc, p_q, (NSUInteger)ctx->q_dim);
+
+            [enc setBuffer:L->wk offset:0 atIndex:0];
+            [enc setBuffer:ctx->input offset:0 atIndex:1];
+            [enc setBuffer:ctx->k offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:3];
+            dispatch_1d(enc, p_q, (NSUInteger)ctx->kv_dim);
+        }
+
+        /* V always FP16 */
         [enc setBuffer:L->wv offset:0 atIndex:0];
         [enc setBuffer:ctx->input offset:0 atIndex:1];
         [enc setBuffer:ctx->v offset:0 atIndex:2];
         [enc setBuffer:ctx->u_cols_kv offset:0 atIndex:3];
-        dispatch_1d(enc, ctx->p_matvec, (NSUInteger)ctx->kv_dim);
+        dispatch_1d(enc, ctx->p_matvec_f16, (NSUInteger)ctx->kv_dim);
         barrier_bufs(enc);
 
         /* Q RMS */
@@ -594,12 +868,29 @@ int tg_metal_attention_decode(void *ctx_v, int layer, const float *input,
         dispatch_1d(enc, ctx->p_gqa, (NSUInteger)ctx->n_heads);
         barrier_bufs(enc);
 
-        /* O = Wo @ attn_out */
-        [enc setBuffer:L->wo offset:0 atIndex:0];
-        [enc setBuffer:ctx->attn_out offset:0 atIndex:1];
-        [enc setBuffer:ctx->output offset:0 atIndex:2];
-        [enc setBuffer:ctx->u_cols_o offset:0 atIndex:3];
-        dispatch_1d(enc, ctx->p_matvec, (NSUInteger)ctx->embed_dim);
+        /* O */
+        if (use_q8) {
+            [enc setBuffer:ctx->attn_out offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_o offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_o offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_nblk_o offset:0 atIndex:3];
+            dispatch_1d(enc, ctx->p_quantize_q8, (NSUInteger)(ctx->q_dim / 256));
+            barrier_bufs(enc);
+            [enc setBuffer:L->wo offset:0 atIndex:0];
+            [enc setBuffer:ctx->q8_scales_o offset:0 atIndex:1];
+            [enc setBuffer:ctx->q8_qs_o offset:0 atIndex:2];
+            [enc setBuffer:ctx->output offset:0 atIndex:3];
+            [enc setBuffer:ctx->u_cols_o offset:0 atIndex:4];
+            dispatch_1d(enc, ctx->p_matvec_q4k_q8, (NSUInteger)ctx->embed_dim);
+        } else {
+            id<MTLComputePipelineState> p_o = (L->mode == LAYER_MODE_Q4)
+                ? ctx->p_matvec_q4k : ctx->p_matvec_f16;
+            [enc setBuffer:L->wo offset:0 atIndex:0];
+            [enc setBuffer:ctx->attn_out offset:0 atIndex:1];
+            [enc setBuffer:ctx->output offset:0 atIndex:2];
+            [enc setBuffer:ctx->u_cols_o offset:0 atIndex:3];
+            dispatch_1d(enc, p_o, (NSUInteger)ctx->embed_dim);
+        }
 
         [enc endEncoding];
         [cb commit];
@@ -614,9 +905,11 @@ int tg_metal_attention_decode(void *ctx_v, int layer, const float *input,
         memcpy(output, [ctx->output contents],
                (size_t)ctx->embed_dim * sizeof(float));
 
-        /* Track length from last layer's pos (engine calls layers 0..N-1 at same pos) */
         if (layer == ctx->n_layers - 1)
             ctx->kv_len = pos + 1;
+
+        ctx->decode_ms_sum += mono_ms() - t0;
+        ctx->decode_calls += 1;
         return 0;
     }
 }

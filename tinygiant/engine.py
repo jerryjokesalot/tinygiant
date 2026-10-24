@@ -247,9 +247,11 @@ class NWSEngine:
 
 
     def _try_init_metal_attn(self):
-        """Upload FP16 attention weights to Metal; drop host copies on success."""
+        """Upload attention weights to Metal; prefer Q4_K to avoid FP16 expand."""
         lib = self.tg_lib
-        print("  Metal attention: uploading FP16 weights (migrate off host)...",
+        use_q4 = bool(self.attn_q4 and hasattr(lib, "tg_metal_upload_layer_q4"))
+        kind = "Q4_K Q/K/O + FP16 V" if use_q4 else "FP16"
+        print(f"  Metal attention: uploading {kind} (migrate off host)...",
               end="", flush=True)
         t0 = time.perf_counter()
         ctx = lib.tg_metal_create(
@@ -279,32 +281,48 @@ class NWSEngine:
             for i in range(N_LAYERS):
                 aw = self.attn_weights[i]
                 q_norm_w, k_norm_w = self.qk_norms[i]
-                if self.attn_q4:
-                    tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
-                    tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
-                    to = self.tensor_map[f"blk.{i}.attn_output.weight"]
-                    wq = gguf_dequantize(tq.data, tq.tensor_type).astype(np.float16)
-                    wk = gguf_dequantize(tk.data, tk.tensor_type).astype(np.float16)
-                    wo = gguf_dequantize(to.data, to.tensor_type).astype(np.float16)
-                    wv = np.asarray(aw["v"], dtype=np.float16)
+                if use_q4:
+                    # Contiguous Q4 bytes already loaded for CPU path.
+                    wq = np.ascontiguousarray(aw["q"])
+                    wk = np.ascontiguousarray(aw["k"])
+                    wo = np.ascontiguousarray(aw["o"])
+                    wv = np.ascontiguousarray(
+                        np.asarray(aw["v"], dtype=np.float16).reshape(
+                            N_KV_HEADS * HEAD_DIM, EMBED_DIM))
+                    rc = lib.tg_metal_upload_layer_q4(
+                        ctx, i,
+                        wq.ctypes.data, wk.ctypes.data,
+                        wv.ctypes.data, wo.ctypes.data,
+                        q_norm_w.ctypes.data, k_norm_w.ctypes.data)
+                    if rc != 0:
+                        raise RuntimeError(f"q4 upload layer {i} rc={rc}")
+                    total_mb += (wq.nbytes + wk.nbytes + wv.nbytes + wo.nbytes) / 1024**2
                 else:
-                    wq = aw["q"].astype(np.float16)
-                    wk = aw["k"].astype(np.float16)
-                    wv = aw["v"].astype(np.float16)
-                    wo = aw["o"].astype(np.float16)
-                # Row-major [out_rows, in_cols] matching tg_f32_matvec.
-                wq = np.ascontiguousarray(wq.reshape(N_HEADS * HEAD_DIM, EMBED_DIM))
-                wk = np.ascontiguousarray(wk.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
-                wv = np.ascontiguousarray(wv.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
-                wo = np.ascontiguousarray(wo.reshape(EMBED_DIM, N_HEADS * HEAD_DIM))
-                rc = lib.tg_metal_upload_layer_f16(
-                    ctx, i,
-                    wq.ctypes.data, wk.ctypes.data,
-                    wv.ctypes.data, wo.ctypes.data,
-                    q_norm_w.ctypes.data, k_norm_w.ctypes.data)
-                if rc != 0:
-                    raise RuntimeError(f"upload layer {i} rc={rc}")
-                total_mb += (wq.nbytes + wk.nbytes + wv.nbytes + wo.nbytes) / 1024**2
+                    if self.attn_q4:
+                        tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
+                        tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
+                        to = self.tensor_map[f"blk.{i}.attn_output.weight"]
+                        wq = gguf_dequantize(tq.data, tq.tensor_type).astype(np.float16)
+                        wk = gguf_dequantize(tk.data, tk.tensor_type).astype(np.float16)
+                        wo = gguf_dequantize(to.data, to.tensor_type).astype(np.float16)
+                        wv = np.asarray(aw["v"], dtype=np.float16)
+                    else:
+                        wq = aw["q"].astype(np.float16)
+                        wk = aw["k"].astype(np.float16)
+                        wv = aw["v"].astype(np.float16)
+                        wo = aw["o"].astype(np.float16)
+                    wq = np.ascontiguousarray(wq.reshape(N_HEADS * HEAD_DIM, EMBED_DIM))
+                    wk = np.ascontiguousarray(wk.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
+                    wv = np.ascontiguousarray(wv.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
+                    wo = np.ascontiguousarray(wo.reshape(EMBED_DIM, N_HEADS * HEAD_DIM))
+                    rc = lib.tg_metal_upload_layer_f16(
+                        ctx, i,
+                        wq.ctypes.data, wk.ctypes.data,
+                        wv.ctypes.data, wo.ctypes.data,
+                        q_norm_w.ctypes.data, k_norm_w.ctypes.data)
+                    if rc != 0:
+                        raise RuntimeError(f"f16 upload layer {i} rc={rc}")
+                    total_mb += (wq.nbytes + wk.nbytes + wv.nbytes + wo.nbytes) / 1024**2
                 # Drop host copies — Metal shared buffer is the sole residency.
                 self.attn_weights[i] = {"q": None, "k": None, "v": None, "o": None}
         except Exception as exc:
@@ -323,7 +341,7 @@ class NWSEngine:
         self.metal_ctx = ctx
         self.use_metal_attn = True
         print(f" OK in {time.perf_counter()-t0:.1f}s "
-              f"({total_mb:.0f} MB FP16 on Metal, host attn+KV released)")
+              f"({total_mb:.0f} MB {kind} on Metal, host attn+KV released)")
 
     def _reload_attn_weights_host(self):
         """Best-effort restore host attention weights after a failed Metal migrate."""

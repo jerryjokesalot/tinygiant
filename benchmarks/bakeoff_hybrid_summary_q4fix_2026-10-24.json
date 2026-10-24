@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-24",
+  "machine": "MacBook-Pro Apple M1 16GB",
+  "tinygiant_commit": "6cb9a14",
+  "fix": "Q4_K Metal upload + Q4xQ8 matvec (no FP16 expand)",
+  "baseline_fp16_hybrid": {
+    "decode_mean": 0.9134508738969151,
+    "cpu_mean": 2.696728792064434,
+    "speedup": 0.3387
+  },
+  "primary_decode_tok_s": {
+    "cpu_only": {
+      "mean": 3.005770645682899,
+      "std": 0.7909949070033725,
+      "n": 15
+    },
+    "hybrid_metal_q4": {
+      "mean": 1.149076660491273,
+      "std": 0.22672477923818096,
+      "n": 15,
+      "metal_used_all": true
+    }
+  },
+  "speedup_hybrid_vs_cpu": 0.382290199733522,
+  "hybrid_abs_improvement_vs_fp16_baseline": 1.257951241087705,
+  "hybrid_clear_win_gt_5pct": false,
+  "recommend_flip_HYBRID_ATTN_READY": false,
+  "verdict": "Q4 Metal hybrid improved absolute tok/s vs FP16 hybrid but still ~0.38x cpu-only; do not flip HYBRID_ATTN_READY"
+}

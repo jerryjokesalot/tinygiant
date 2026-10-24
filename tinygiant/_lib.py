@@ -87,11 +87,18 @@ def load_tinygiant_lib(lib_path=None):
         lib.tg_metal_upload_layer_f16.restype = CI
         lib.tg_metal_upload_layer_f16.argtypes = [
             VP, CI, VP, VP, VP, VP, VP, VP]
+        lib.tg_metal_upload_layer_q4.restype = CI
+        lib.tg_metal_upload_layer_q4.argtypes = [
+            VP, CI, VP, VP, VP, VP, VP, VP]
         lib.tg_metal_set_rope.restype = CI
         lib.tg_metal_set_rope.argtypes = [VP, VP, VP, CI]
         lib.tg_metal_reset_kv.restype = None
         lib.tg_metal_reset_kv.argtypes = [VP]
         lib.tg_metal_attention_decode.restype = CI
         lib.tg_metal_attention_decode.argtypes = [VP, CI, VP, VP, CI]
+        lib.tg_metal_timing.restype = None
+        lib.tg_metal_timing.argtypes = [VP, VP, VP]
+        lib.tg_metal_timing_reset.restype = None
+        lib.tg_metal_timing_reset.argtypes = [VP]
 
     return lib

@@ -18,9 +18,21 @@ Closest peer work: [llama.cpp MoE SSD streaming discussion / PRs](https://github
 
 ## Results (honest)
 
-### Sustained chat (what you should expect)
+### Sustained chat — M1 16GB bake-off (2026-10-24)
 
-Prior bake-off on **Apple M3, 16GB**, same model (`Qwen3-30B-A3B-Q4_K_M`), cold file cache (`purge`), 128-token decode — see [`benchmarks/benchmark_2026-08-19_m3_16gb.md`](benchmarks/benchmark_2026-08-19_m3_16gb.md) for method and raw numbers:
+Fair peer on **Apple M1, 16GB**, same model (`Qwen3-30B-A3B-Q4_K_M`), same prompts, measured **decode tok/s** (preferred) after prefill. Method + raw JSON: [`benchmarks/benchmark_2026-10-24_m1_16gb.md`](benchmarks/benchmark_2026-10-24_m1_16gb.md).
+
+| Configuration | Decode tok/s | vs llama.cpp CPU |
+|---------------|-------------:|-----------------:|
+| llama.cpp CPU (`-ngl 0 -t 8`, llama-bench tg128) | **1.06 ± 0.05** | baseline |
+| TinyGiant `pin_nonuniform` (shipped default) | **2.68 ± 0.62** | **~2.5×** |
+| TinyGiant `pin48` (uniform) | **2.78 ± 0.64** | **~2.6×** |
+
+**Verdict:** TinyGiant beats llama.cpp CPU by about **2.5–2.6×** on this machine. In *this* 128-token bake-off, uniform `pin48` slightly edged `pin_nonuniform` on mean decode; the earlier 60-token A/B wall metric had non-uniform ahead (+8%) and remains the ship basis — treat pin choice as within noise on the bake-off decode metric. These are **not** the warm ~25.9 tok/s compute ceiling.
+
+### Prior M3 note (2026-08-19)
+
+Earlier bake-off on **Apple M3, 16GB**, cold file cache (`purge`), 128-token decode — see [`benchmarks/benchmark_2026-08-19_m3_16gb.md`](benchmarks/benchmark_2026-08-19_m3_16gb.md):
 
 | Configuration | tok/s | vs llama.cpp CPU |
 |---------------|-------|------------------|
@@ -28,11 +40,11 @@ Prior bake-off on **Apple M3, 16GB**, same model (`Qwen3-30B-A3B-Q4_K_M`), cold 
 | TinyGiant (mlock pin48) | 3.70–4.54 | ~2.7–3.3× |
 | TinyGiant (mlock pin64) | 4.83–5.08 | ~3.5–3.7× |
 
-Those are **sustained generation** numbers, not a warm microbenchmark. A fresh fair bake-off (same machine, same model, same prompts) is planned for the MVP; do not treat the table above as a new claim.
+Different machine / day; do not average with the M1 table.
 
-### Pinning A/B (M1 16GB, 2026-10-24)
+### Pinning A/B (M1 16GB, 2026-10-24) — ship basis for non-uniform default
 
-Same machine / model / prompts; wall-clock `NWSEngine.generate()` tok/s including prefill (60 decode tokens). Method + raw numbers: [`experiments/pinning_ab_results.json`](experiments/pinning_ab_results.json).
+Wall-clock `NWSEngine.generate()` tok/s including prefill (60 decode tokens). Raw: [`experiments/pinning_ab_results.json`](experiments/pinning_ab_results.json).
 
 | Task | Uniform pin48 | Non-uniform | Delta |
 |------|--------------:|------------:|------:|
@@ -43,17 +55,17 @@ Same machine / model / prompts; wall-clock `NWSEngine.generate()` tok/s includin
 | factual | 2.80 | 3.01 | +7.6% |
 | **average** | **1.90** | **2.05** | **+8.0%** |
 
-Shipped default is non-uniform when the profile exists. These are **not** the warm ~25.9 tok/s compute ceiling.
+Shipped default is non-uniform when the concentration profile exists; uniform pin48 otherwise.
 
 ### Warm compute ceiling (not chat)
 
-Microbenchmarks of the fused Q4×Q8 / Q8+vdot kernel on Apple Silicon can hit **~25.9 tok/s** when experts are already warm in RAM and I/O is zero. That is a **compute ceiling**, not sustained chat speed. Sustained chat is I/O- and pin-hit-rate limited; see the M3 table above.
+Microbenchmarks of the fused Q4×Q8 / Q8+vdot kernel on Apple Silicon can hit **~25.9 tok/s** when experts are already warm in RAM and I/O is zero. That is a **compute ceiling**, not sustained chat speed. Sustained chat is I/O- and pin-hit-rate limited; see the M1 / M3 tables above.
 
 Earlier dequant+BLAS and prototype cascade numbers live in [`docs/results.md`](docs/results.md). Cascade / Learning Cache remain deferred.
 
 ### RAM budget (pinning hot experts, 16 GB machine)
 
-With attention mlock'd and a pin48–pin64 warm expert set, the working set fits in 16 GB with OS headroom. Exact budgets for the M3 run are in the [benchmark note](benchmarks/benchmark_2026-08-19_m3_16gb.md).
+With attention mlock'd and a pin48–pin64 warm expert set, the working set fits in 16 GB with OS headroom. Exact budgets: [M1 bake-off](benchmarks/benchmark_2026-10-24_m1_16gb.md), [M3 note](benchmarks/benchmark_2026-08-19_m3_16gb.md).
 
 ## How It Works
 
@@ -127,6 +139,8 @@ tinygiant-setup \
 ```
 
 ### 4. First chat (CLI)
+
+`--pin 48` is the total expert budget (48 × 48 layers = 2304). With the shipped concentration profile, TinyGiant allocates that budget **non-uniformly** (entropy-weighted); without a profile it falls back to uniform pin48.
 
 ```bash
 tinygiant \
@@ -211,7 +225,7 @@ tinygiant/
 - [x] Packaged install (`pip install -e .`, `tinygiant` / `tinygiant-setup` / `tinygiant-server`)
 - [x] File llama.cpp RFC ([Discussion #27149](https://github.com/ggml-org/llama.cpp/discussions/27149))
 - [x] Pinning A/B shipped with result JSON; non-uniform default when profile exists (+8% avg wall tok/s on M1 16GB)
-- [ ] Fair bake-off refresh vs llama.cpp CPU (same machine / model / prompts)
+- [x] Fair bake-off vs llama.cpp CPU on M1 16GB (2026-10-24; ~2.5–2.6× decode; see `benchmarks/benchmark_2026-10-24_m1_16gb.md`)
 - [ ] Multi-platform hardening (Linux, Windows, varied SSDs)
 - [ ] llama.cpp integration (CPU offload path)
 - [ ] Cascade / Learning Cache — **deferred**

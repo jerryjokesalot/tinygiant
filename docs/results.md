@@ -7,6 +7,11 @@
 ---
 
 
+## Fair bake-off vs llama.cpp CPU — M1 16GB (2026-10-24)
+
+Primary peer: llama.cpp CPU (`-ngl 0 -t 8`, llama-bench tg128). TinyGiant sustained decode ~**2.68–2.78 tok/s** vs llama.cpp ~**1.06 tok/s** (**~2.5–2.6×**). Method, honesty notes (pin48 slightly edged non-uniform on this 128-tok decode metric; A/B wall +8% remains the ship basis; ~25.9 is warm ceiling only): [`benchmarks/benchmark_2026-10-24_m1_16gb.md`](../benchmarks/benchmark_2026-10-24_m1_16gb.md).
+
+---
 ## Pinning A/B — uniform vs non-uniform (2026-10-24)
 
 **Hardware:** Apple M1, 16GB unified memory. **Model:** Qwen3-30B-A3B Q4_K_M + Q4 NWS cache.

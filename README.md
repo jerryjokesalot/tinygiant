@@ -1,6 +1,6 @@
 # TinyGiant
 
-**Tiny footprint. Giant model.** Run 30B+ parameter MoE models on a laptop with 8–16GB RAM and a standard SSD. No GPU required for the CPU path. A **hybrid** profile (Metal attention+KV; experts stay CPU+SSD+pin) has a **real Metal path on Apple Silicon** when libtinygiant is built on Darwin — still **defaults to cpu-only** until a dated bake-off flips `HYBRID_ATTN_READY`. Do not treat hybrid as faster until that bake-off exists.
+**Tiny footprint. Giant model.** Run 30B+ parameter MoE models on a laptop with 8–16GB RAM and a standard SSD. No GPU required for the CPU path — **cpu-only is the ship default**. A **hybrid** profile (Metal attention+KV; experts stay CPU+SSD+pin) is available as an **optional / experimental** opt-in on Apple Silicon when libtinygiant is built on Darwin. On M1 16GB after the Q4 Metal fix, hybrid decode was ~**1.15** vs cpu-only ~**3.01** tok/s (**≈0.38×**); see [`benchmarks/benchmark_2026-10-24_m1_16gb_hybrid_q4fix.md`](benchmarks/benchmark_2026-10-24_m1_16gb_hybrid_q4fix.md). `HYBRID_ATTN_READY` stays **false** — do not treat hybrid as faster or recommended.
 
 Large AI models are locked behind expensive hardware. A 30B model needs 18GB+ RAM just to load — more than most laptops have. TinyGiant streams only the experts the model actually uses from SSD, keeping dormant weights on disk.
 
@@ -139,13 +139,15 @@ tinygiant-setup \
 ```
 
 Setup also probes hardware and writes `profile.json` next to the cache
-(`cpu-only` / `hybrid` / `gpu-heavy`). **Selected defaults to `cpu-only`** until
-Metal attention+KV is proven faster than CPU TinyGiant in a dated bake-off (`HYBRID_ATTN_READY`). On Apple
-Silicon the probe may *recommend* `hybrid` while still selecting `cpu-only`.
-Never auto-selects `gpu-heavy` on ≤16 GiB RAM. Override anytime:
+(`cpu-only` / `hybrid` / `gpu-heavy`). **Selected defaults to `cpu-only`**
+(`HYBRID_ATTN_READY` is false). On Apple Silicon the probe may *recommend*
+`hybrid` while still selecting `cpu-only`. Hybrid/Metal is **optional and
+experimental** — slower than cpu-only on the M1 16GB bake-off (~0.38× decode);
+not recommended for normal use. Never auto-selects `gpu-heavy` on ≤16 GiB RAM.
+Override anytime:
 
 ```bash
-tinygiant --model … --cache … --profile hybrid   # Metal attn on Darwin; fail-opens to CPU otherwise
+tinygiant --model … --cache … --profile hybrid   # experimental Metal attn; slower today; fail-opens to CPU
 tinygiant-server --model … --cache … --profile cpu-only
 ```
 

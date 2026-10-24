@@ -49,3 +49,10 @@ See [`benchmark_2026-10-24_m1_16gb_hybrid_q4fix.md`](benchmark_2026-10-24_m1_16g
 | *prior* hybrid FP16 (`b317b01`) | 0.91 ± 0.24 | 0.34× |
 
 Absolute hybrid gain vs FP16 baseline: **~+26%** (0.91 → 1.15). Still loses to cpu-only on every task. `HYBRID_ATTN_READY` stays false.
+
+## Product decision (2026-10-24)
+
+Jerry: **cpu-only remains the ship default**; Metal/hybrid stays **optional / experimental**.
+`HYBRID_ATTN_READY` stays **false**. Slice B (experts on GPU) still held. Merge this branch
+as experimental Metal path + honest numbers — not as a recommended profile.
+

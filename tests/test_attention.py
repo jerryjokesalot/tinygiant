@@ -1,4 +1,4 @@
-"""Attention backend scaffolding tests — no Metal required."""
+"""Attention backend tests — Metal optional; CPU fail-open always."""
 
 from tinygiant.attention import (
     METAL_ATTN_LINKED,
@@ -9,17 +9,20 @@ from tinygiant.attention import (
 )
 
 
-def test_metal_not_linked_by_default():
-    assert METAL_ATTN_LINKED is False
-    stub = MetalAttentionBackend()
-    assert stub.available is False
-    assert "not yet linked" in stub.describe()
-
-
 def test_cpu_always_available():
     cpu = CpuAttentionBackend()
     assert cpu.available is True
     assert "CPU" in cpu.describe()
+
+
+def test_metal_backend_respects_linked_flag():
+    stub = MetalAttentionBackend(linked=False)
+    assert stub.available is False
+    assert "not available" in stub.describe() or "falling back" in stub.describe()
+
+    linked = MetalAttentionBackend(linked=True)
+    assert linked.available is True
+    assert "Metal" in linked.describe()
 
 
 def test_hybrid_fail_opens_to_cpu(capsys):
@@ -40,7 +43,13 @@ def test_cpu_only_stays_cpu():
     assert backend.name == "cpu"
 
 
-def test_metal_attn_status_has_todo():
+def test_metal_attn_status_shape():
     st = metal_attn_status()
-    assert st["metal_attn_linked"] is False
-    assert "TODO" in st["todo"] or "Implement" in st["todo"]
+    assert "metal_attn_linked" in st
+    assert st["metal_attn_linked"] is METAL_ATTN_LINKED
+    assert "todo" in st
+    assert "Bake-off" in st["todo"] or "bake-off" in st["todo"].lower()
+
+
+def test_metal_linked_is_bool():
+    assert isinstance(METAL_ATTN_LINKED, bool)

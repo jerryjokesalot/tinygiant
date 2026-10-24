@@ -334,6 +334,15 @@ def cmd_serve():
     parser.add_argument("--model-name", default="tinygiant-qwen3-30b",
                         help="Model name in API responses")
     parser.add_argument("--config", help="Path to JSON config file")
+    parser.add_argument(
+        "--profile",
+        choices=["cpu-only", "hybrid", "gpu-heavy"],
+        default=None,
+        help=(
+            "Compute profile (default: cache profile.json, else cpu-only). "
+            "hybrid requests Metal attn when linked; fail-opens to CPU today."
+        ),
+    )
     args = parser.parse_args()
 
     # Load config file if provided (CLI args override)
@@ -354,6 +363,8 @@ def cmd_serve():
             args.calibrate = cfg["calibrate"]
         if args.model_name == "tinygiant-qwen3-30b" and "model_name" in cfg:
             args.model_name = cfg["model_name"]
+        if args.profile is None and "profile" in cfg:
+            args.profile = cfg["profile"]
 
     if not args.model or not args.cache:
         parser.error("--model and --cache are required (via CLI or --config)")
@@ -376,8 +387,14 @@ def cmd_serve():
     _tokenizer = _init_tokenizer(model_path)
     print(" done")
 
+    # Resolve compute profile (Slice C); attention backend fail-opens to CPU
+    from .profile import resolve_runtime_profile
+    decision = resolve_runtime_profile(cache_dir, cli_profile=args.profile)
+    print(f"Profile: {decision.selected} (recommended={decision.recommended})")
+    print(f"  {decision.reason}")
+
     # Init engine
-    _engine = NWSEngine(model_path, cache_dir)
+    _engine = NWSEngine(model_path, cache_dir, profile=decision.selected)
 
     # Calibrate and pin
     cal_prompt = "The key insight about mixture-of-experts models is that"

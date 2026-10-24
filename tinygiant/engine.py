@@ -86,11 +86,19 @@ def _scale_pins(pins, total_budget, n_layers):
 
 class NWSEngine:
 
-    def __init__(self, model_path, cache_dir, lib_path=None):
+    def __init__(self, model_path, cache_dir, lib_path=None, profile="cpu-only"):
         print("TinyGiant Inference Engine")
         print("=" * 60)
 
         t_start = time.perf_counter()
+
+        # Device / attention profile (Slice A scaffolding). Experts stay CPU+SSD.
+        from .attention import resolve_attention_backend
+        self.profile = (profile or "cpu-only").strip().lower().replace("_", "-")
+        self.attn_backend = resolve_attention_backend(self.profile)
+        self.metal_ctx = None
+        self.use_metal_attn = False
+        print(f"Profile: {self.profile}; attention: {self.attn_backend.describe()}")
 
         # Load GGUF
         print("Loading GGUF reader...", end="", flush=True)
@@ -195,8 +203,17 @@ class NWSEngine:
             for _ in range(N_LAYERS)
         ]
 
-        # mlock attention weights
-        if self.tg_lib:
+        # Metal attention+KV (Slice A): migrate FP16 weights into shared Metal
+        # buffers and drop host copies (no double residency). Fail-open to CPU.
+        if (
+            self.attn_backend.name == "metal"
+            and self.attn_backend.available
+            and self.tg_lib
+            and hasattr(self.tg_lib, "tg_metal_create")
+        ):
+            self._try_init_metal_attn()
+        elif self.tg_lib:
+            # CPU path: mlock attention weights
             for i in range(N_LAYERS):
                 for k, v in self.attn_weights[i].items():
                     self.tg_lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
@@ -207,9 +224,13 @@ class NWSEngine:
 
     def reset_kv(self):
         self.kv_len = 0
+        if self.use_metal_attn and self.metal_ctx and self.tg_lib:
+            self.tg_lib.tg_metal_reset_kv(self.metal_ctx)
         for i in range(N_LAYERS):
-            self.kv_k[i][:] = 0
-            self.kv_v[i][:] = 0
+            if self.kv_k[i] is not None:
+                self.kv_k[i][:] = 0
+            if self.kv_v[i] is not None:
+                self.kv_v[i][:] = 0
             self.kv_cache[i] = {
                 "k": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
                 "v": np.zeros((N_KV_HEADS, 0, HEAD_DIM), dtype=np.float32),
@@ -223,6 +244,119 @@ class NWSEngine:
             logits = self.forward_one_token(next_token, len(prompt_tokens) + step)
             next_token = int(np.argmax(logits))
         self.reset_kv()
+
+
+    def _try_init_metal_attn(self):
+        """Upload FP16 attention weights to Metal; drop host copies on success."""
+        lib = self.tg_lib
+        print("  Metal attention: uploading FP16 weights (migrate off host)...",
+              end="", flush=True)
+        t0 = time.perf_counter()
+        ctx = lib.tg_metal_create(
+            N_LAYERS, EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, self.kv_max)
+        if not ctx:
+            print(" FAILED (create); keeping CPU mlock path")
+            for i in range(N_LAYERS):
+                for k, v in self.attn_weights[i].items():
+                    lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
+            return
+
+        if lib.tg_metal_set_rope(
+            ctx,
+            self.rope_cos.ctypes.data,
+            self.rope_sin.ctypes.data,
+            int(self.rope_cos.shape[0]),
+        ) != 0:
+            print(" FAILED (rope); keeping CPU")
+            lib.tg_metal_destroy(ctx)
+            for i in range(N_LAYERS):
+                for k, v in self.attn_weights[i].items():
+                    lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
+            return
+
+        total_mb = 0.0
+        try:
+            for i in range(N_LAYERS):
+                aw = self.attn_weights[i]
+                q_norm_w, k_norm_w = self.qk_norms[i]
+                if self.attn_q4:
+                    tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
+                    tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
+                    to = self.tensor_map[f"blk.{i}.attn_output.weight"]
+                    wq = gguf_dequantize(tq.data, tq.tensor_type).astype(np.float16)
+                    wk = gguf_dequantize(tk.data, tk.tensor_type).astype(np.float16)
+                    wo = gguf_dequantize(to.data, to.tensor_type).astype(np.float16)
+                    wv = np.asarray(aw["v"], dtype=np.float16)
+                else:
+                    wq = aw["q"].astype(np.float16)
+                    wk = aw["k"].astype(np.float16)
+                    wv = aw["v"].astype(np.float16)
+                    wo = aw["o"].astype(np.float16)
+                # Row-major [out_rows, in_cols] matching tg_f32_matvec.
+                wq = np.ascontiguousarray(wq.reshape(N_HEADS * HEAD_DIM, EMBED_DIM))
+                wk = np.ascontiguousarray(wk.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
+                wv = np.ascontiguousarray(wv.reshape(N_KV_HEADS * HEAD_DIM, EMBED_DIM))
+                wo = np.ascontiguousarray(wo.reshape(EMBED_DIM, N_HEADS * HEAD_DIM))
+                rc = lib.tg_metal_upload_layer_f16(
+                    ctx, i,
+                    wq.ctypes.data, wk.ctypes.data,
+                    wv.ctypes.data, wo.ctypes.data,
+                    q_norm_w.ctypes.data, k_norm_w.ctypes.data)
+                if rc != 0:
+                    raise RuntimeError(f"upload layer {i} rc={rc}")
+                total_mb += (wq.nbytes + wk.nbytes + wv.nbytes + wo.nbytes) / 1024**2
+                # Drop host copies — Metal shared buffer is the sole residency.
+                self.attn_weights[i] = {"q": None, "k": None, "v": None, "o": None}
+        except Exception as exc:
+            print(f" FAILED ({exc}); destroying Metal ctx, restoring CPU")
+            lib.tg_metal_destroy(ctx)
+            self._reload_attn_weights_host()
+            for i in range(N_LAYERS):
+                for k, v in self.attn_weights[i].items():
+                    if v is not None:
+                        lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
+            return
+
+        # KV lives on Metal; free host KV arrays to avoid double residency.
+        self.kv_k = [None] * N_LAYERS
+        self.kv_v = [None] * N_LAYERS
+        self.metal_ctx = ctx
+        self.use_metal_attn = True
+        print(f" OK in {time.perf_counter()-t0:.1f}s "
+              f"({total_mb:.0f} MB FP16 on Metal, host attn+KV released)")
+
+    def _reload_attn_weights_host(self):
+        """Best-effort restore host attention weights after a failed Metal migrate."""
+        restored = []
+        for i in range(N_LAYERS):
+            aw = self.attn_weights[i]
+            if aw.get("q") is not None:
+                restored.append(aw)
+                continue
+            if self.attn_q4:
+                tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
+                tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
+                tv = self.tensor_map[f"blk.{i}.attn_v.weight"]
+                to = self.tensor_map[f"blk.{i}.attn_output.weight"]
+                restored.append({
+                    "q": tq.data.reshape(-1).view(np.uint8).copy(),
+                    "k": tk.data.reshape(-1).view(np.uint8).copy(),
+                    "v": gguf_dequantize(tv.data, tv.tensor_type).astype(np.float16).copy(),
+                    "o": to.data.reshape(-1).view(np.uint8).copy(),
+                })
+            else:
+                restored.append({
+                    "q": _dequant(self.tensor_map[f"blk.{i}.attn_q.weight"]),
+                    "k": _dequant(self.tensor_map[f"blk.{i}.attn_k.weight"]),
+                    "v": _dequant(self.tensor_map[f"blk.{i}.attn_v.weight"]),
+                    "o": _dequant(self.tensor_map[f"blk.{i}.attn_output.weight"]),
+                })
+        self.attn_weights = restored
+        self.kv_k = [np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
+                     for _ in range(N_LAYERS)]
+        self.kv_v = [np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
+                     for _ in range(N_LAYERS)]
+
 
     def pin_experts(self, n_per_layer, calibrate_tokens=None, prompt_tokens=None):
         """Pin hot experts into physical memory.
@@ -292,7 +426,41 @@ class NWSEngine:
             normed = np.empty(EMBED_DIM, dtype=np.float32)
             lib.tg_rms_norm(x.ctypes.data, self.attn_norms[i].ctypes.data,
                             normed.ctypes.data, EMBED_DIM, ctypes.c_float(RMS_EPS))
-            if self.attn_q4:
+            if self.use_metal_attn and self.metal_ctx:
+                rc = lib.tg_metal_attention_decode(
+                    self.metal_ctx, i,
+                    normed.ctypes.data, attn_out.ctypes.data, pos)
+                if rc != 0:
+                    # Fail-open once: disable Metal for remainder of session.
+                    print(f"[tinygiant] Metal attn decode failed (rc={rc}); "
+                          "falling back to CPU for this session")
+                    self.use_metal_attn = False
+                    # Fall through to CPU below with host weights if still present
+                    if aw is None or aw.get("q") is None:
+                        raise RuntimeError(
+                            "Metal attn failed after host weights were migrated; "
+                            "restart with --profile cpu-only")
+                    if self.attn_q4:
+                        lib.tg_attention_decode_q4(
+                            aw["q"].ctypes.data, aw["k"].ctypes.data,
+                            aw["v"].ctypes.data, aw["o"].ctypes.data,
+                            q_norm_w.ctypes.data, k_norm_w.ctypes.data,
+                            self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
+                            pos, self.kv_max,
+                            self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
+                            normed.ctypes.data, attn_out.ctypes.data,
+                            EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+                    else:
+                        lib.tg_attention_decode(
+                            aw["q"].ctypes.data, aw["k"].ctypes.data,
+                            aw["v"].ctypes.data, aw["o"].ctypes.data,
+                            q_norm_w.ctypes.data, k_norm_w.ctypes.data,
+                            self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data,
+                            pos, self.kv_max,
+                            self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
+                            normed.ctypes.data, attn_out.ctypes.data,
+                            EMBED_DIM, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+            elif self.attn_q4:
                 lib.tg_attention_decode_q4(
                     aw["q"].ctypes.data, aw["k"].ctypes.data,
                     aw["v"].ctypes.data, aw["o"].ctypes.data,

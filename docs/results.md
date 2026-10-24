@@ -58,9 +58,9 @@ Model: Qwen3-30B-A3B, 48 layers, 128 experts (8 active), f16 expert cache.
 
 With Q4_K_M experts (~2.2 MB), I/O per expert drops to ~0.27 ms vs 4.7 ms compute/layer. Pipelining hides all misses at any cache hit rate. 32 pinned/layer × 48 layers = 3.4 GB for 88% oracle hit. (Projected from measured SSD throughput, not directly benchmarked.)
 
-### End-to-End Inference (nws_e2e_inference.py)
+### End-to-End Inference (`tinygiant` / NWSEngine)
 
-Pure Python/numpy inference generating coherent text from the 30B model using the contiguous cache. Verified correct output. 0.34 tok/s (Python overhead; C benchmark shows 4.4 tok/s ceiling).
+Packaged path: `tinygiant` / `tinygiant-server` → `NWSEngine`. Q4 caches use the fused path (`NWSEngine._forward_c` → `csrc/libtinygiant.c`); f16 caches fall back to numpy. Early Python/numpy e2e generated coherent text from the contiguous cache at ~0.34 tok/s (interpreter overhead; contemporaneous C dequant+BLAS ceiling was ~4.4 tok/s). Sustained fused-Q4 chat numbers belong in dated notes under `benchmarks/` — do not treat warm microbenchmark ceilings as chat speed.
 
 ---
 

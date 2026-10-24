@@ -3,6 +3,7 @@ __pycache__/
 *.gguf
 *.json
 !service/*.json
+!experiments/*_results.json
 .DS_Store
 
 # Build artifacts

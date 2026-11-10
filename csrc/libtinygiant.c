@@ -11,6 +11,7 @@
  *   gcc -shared -fPIC -O3 -march=armv8.2-a+dotprod -o libtinygiant.so csrc/libtinygiant.c
  */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <sys/mman.h>
@@ -711,18 +712,28 @@ void tg_attention_decode(
     apply_rope_inplace(q_normed, n_heads, head_dim, rope_cos, rope_sin, pos);
     apply_rope_inplace(k_normed, n_kv_heads, head_dim, rope_cos, rope_sin, pos);
 
-    /* Append to KV cache: kv_k/kv_v are [n_kv_heads, kv_max, head_dim] */
-    for (int h = 0; h < n_kv_heads; h++) {
-        memcpy(kv_k + ((size_t)h * kv_max + kv_len) * head_dim,
-               k_normed + h * head_dim, head_dim * sizeof(float));
-        memcpy(kv_v + ((size_t)h * kv_max + kv_len) * head_dim,
-               v + h * head_dim, head_dim * sizeof(float));
+    /* Append to KV cache: kv_k/kv_v are [n_kv_heads, kv_max, head_dim].
+     * Guard: if context has grown past kv_max (should not happen when the
+     * Python layer enforces the limit) treat as a no-op write so we at
+     * least don't corrupt heap memory. */
+    if (kv_len < kv_max) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            memcpy(kv_k + ((size_t)h * kv_max + kv_len) * head_dim,
+                   k_normed + h * head_dim, head_dim * sizeof(float));
+            memcpy(kv_v + ((size_t)h * kv_max + kv_len) * head_dim,
+                   v + h * head_dim, head_dim * sizeof(float));
+        }
     }
 
-    /* GQA attention */
+    /* GQA attention.
+     * scores[] grows with sequence length — heap-allocate to avoid blowing
+     * the stack at long contexts (VLA of 20 000 floats × 32 heads × 48 layers
+     * would overflow the default 8 MB thread stack). */
     float attn_out[q_dim];
-    int seq_len = kv_len + 1;
+    int seq_len = (kv_len < kv_max) ? kv_len + 1 : kv_max;
     float inv_sqrt = 1.f / sqrtf((float)head_dim);
+    float *scores = (float *)malloc((size_t)seq_len * sizeof(float));
+    if (!scores) return; /* OOM: skip layer rather than crash */
 
     for (int h = 0; h < n_heads; h++) {
         int kv_h = h / gqa_ratio;
@@ -731,7 +742,6 @@ void tg_attention_decode(
         const float *v_cache = kv_v + (size_t)kv_h * kv_max * head_dim;
 
         /* Compute attention scores */
-        float scores[seq_len];
         float max_score = -1e30f;
         for (int t = 0; t < seq_len; t++) {
             const float *kt = k_cache + t * head_dim;
@@ -757,6 +767,7 @@ void tg_attention_decode(
             tg_accumulate_scaled_f32(out_h, vt, w, head_dim);
         }
     }
+    free(scores);
 
     /* Output projection */
     tg_f32_matvec(wo, attn_out, output, embed_dim, q_dim);
@@ -798,17 +809,22 @@ void tg_attention_decode_q4(
     apply_rope_inplace(k_normed, n_kv_heads, head_dim, rope_cos, rope_sin, pos);
 
     /* Append to KV cache */
-    for (int h = 0; h < n_kv_heads; h++) {
-        memcpy(kv_k + ((size_t)h * kv_max + kv_len) * head_dim,
-               k_normed + h * head_dim, head_dim * sizeof(float));
-        memcpy(kv_v + ((size_t)h * kv_max + kv_len) * head_dim,
-               v + h * head_dim, head_dim * sizeof(float));
+    if (kv_len < kv_max) {
+        for (int h = 0; h < n_kv_heads; h++) {
+            memcpy(kv_k + ((size_t)h * kv_max + kv_len) * head_dim,
+                   k_normed + h * head_dim, head_dim * sizeof(float));
+            memcpy(kv_v + ((size_t)h * kv_max + kv_len) * head_dim,
+                   v + h * head_dim, head_dim * sizeof(float));
+        }
     }
 
-    /* GQA attention */
+    /* GQA attention — heap-allocate scores to avoid VLA stack overflow at
+     * long contexts. */
     float attn_out[q_dim];
-    int seq_len = kv_len + 1;
+    int seq_len = (kv_len < kv_max) ? kv_len + 1 : kv_max;
     float inv_sqrt = 1.f / sqrtf((float)head_dim);
+    float *scores = (float *)malloc((size_t)seq_len * sizeof(float));
+    if (!scores) return;
 
     for (int h = 0; h < n_heads; h++) {
         int kv_h = h / gqa_ratio;
@@ -816,7 +832,6 @@ void tg_attention_decode_q4(
         const float *k_cache = kv_k + (size_t)kv_h * kv_max * head_dim;
         const float *v_cache = kv_v + (size_t)kv_h * kv_max * head_dim;
 
-        float scores[seq_len];
         float max_score = -1e30f;
         for (int t = 0; t < seq_len; t++) {
             const float *kt = k_cache + t * head_dim;
@@ -840,6 +855,7 @@ void tg_attention_decode_q4(
             tg_accumulate_scaled_f32(out_h, vt, w, head_dim);
         }
     }
+    free(scores);
 
     /* Output projection via fused Q4×Q8 */
     matmul_q4k(wo_q4, attn_out, output, embed_dim, q_dim);

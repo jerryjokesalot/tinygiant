@@ -134,6 +134,18 @@ class Handler(BaseHTTPRequestHandler):
         prompt = _format_chat(messages)
         tokens = _tokenize(prompt)
 
+        total_needed = len(tokens) + max_tokens
+        if total_needed > _engine.max_context:
+            self._send_json(400, {
+                "status": "error",
+                "result": (
+                    f"Request requires {total_needed} tokens "
+                    f"({len(tokens)} prompt + {max_tokens} max_tokens) "
+                    f"but the server context window is {_engine.max_context}."
+                ),
+            })
+            return
+
         _engine.reset_kv()
 
         generated = []
@@ -179,6 +191,24 @@ class Handler(BaseHTTPRequestHandler):
         tokens = _tokenize(prompt)
         request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
+
+        # Enforce context limit before spending any compute.
+        total_needed = len(tokens) + max_tokens
+        if total_needed > _engine.max_context:
+            self._send_json(400, {
+                "error": {
+                    "type": "context_length_exceeded",
+                    "message": (
+                        f"Request requires {total_needed} tokens "
+                        f"({len(tokens)} prompt + {max_tokens} max_tokens) "
+                        f"but the server context window is {_engine.max_context}. "
+                        f"Reduce max_tokens or shorten your prompt."
+                    ),
+                    "param": "max_tokens",
+                    "code": "context_length_exceeded",
+                }
+            })
+            return
 
         _engine.reset_kv()
 
@@ -333,6 +363,12 @@ def cmd_serve():
     parser.add_argument("--calibrate", type=int, default=10, help="Calibration tokens")
     parser.add_argument("--model-name", default="tinygiant-qwen3-30b",
                         help="Model name in API responses")
+    parser.add_argument("--max-context", type=int, default=4096,
+                        help=(
+                            "Maximum context window in tokens (prompt + completion). "
+                            "Larger values increase RAM usage for the KV cache. "
+                            "Must not exceed the model's native limit (default: 4096)."
+                        ))
     parser.add_argument("--config", help="Path to JSON config file")
     parser.add_argument(
         "--profile",
@@ -365,6 +401,8 @@ def cmd_serve():
             args.model_name = cfg["model_name"]
         if args.profile is None and "profile" in cfg:
             args.profile = cfg["profile"]
+        if args.max_context == 4096 and "max_context" in cfg:
+            args.max_context = int(cfg["max_context"])
 
     if not args.model or not args.cache:
         parser.error("--model and --cache are required (via CLI or --config)")
@@ -394,7 +432,8 @@ def cmd_serve():
     print(f"  {decision.reason}")
 
     # Init engine
-    _engine = NWSEngine(model_path, cache_dir, profile=decision.selected)
+    _engine = NWSEngine(model_path, cache_dir, profile=decision.selected,
+                        max_context=args.max_context)
 
     # Calibrate and pin
     cal_prompt = "The key insight about mixture-of-experts models is that"
@@ -406,6 +445,7 @@ def cmd_serve():
     server = HTTPServer((args.host, args.port), Handler)
     print(f"\nTinyGiant API server running on http://{args.host}:{args.port}")
     print(f"  Model: {_model_name}")
+    print(f"  Context window: {args.max_context} tokens")
     print(f"  Endpoints:")
     print(f"    POST /v1/chat/completions  (OpenAI-compatible)")
     print(f"    POST /v1/paperclip         (Paperclip webhook)")

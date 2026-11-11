@@ -86,7 +86,8 @@ def _scale_pins(pins, total_budget, n_layers):
 
 class NWSEngine:
 
-    def __init__(self, model_path, cache_dir, lib_path=None, profile="cpu-only"):
+    def __init__(self, model_path, cache_dir, lib_path=None, profile="cpu-only",
+                 max_context: int = 4096):
         print("TinyGiant Inference Engine")
         print("=" * 60)
 
@@ -106,6 +107,30 @@ class NWSEngine:
         self.reader = GGUFReader(model_path)
         self.tensor_map = {t.name: t for t in self.reader.tensors}
         print(f" {time.perf_counter()-t0:.1f}s")
+
+        # Detect model's native context length from GGUF metadata (not hardcoded)
+        self.model_max_context = None
+        for key in self.reader.fields:
+            if "context_length" in key:
+                val = self.reader.fields[key]
+                try:
+                    raw = val.parts[val.data[0]]
+                    self.model_max_context = int(raw[0]) if hasattr(raw, "__len__") else int(raw)
+                    break
+                except (IndexError, TypeError, ValueError):
+                    pass
+
+        # Validate and store context limit.
+        if max_context is not None and max_context < 1:
+            raise ValueError(f"max_context must be >= 1, got {max_context}")
+        if self.model_max_context is not None and max_context is not None and max_context > self.model_max_context:
+            raise ValueError(
+                f"max_context {max_context} exceeds model supported context length "
+                f"{self.model_max_context}"
+            )
+        self.max_context = max_context if max_context is not None else (self.model_max_context or 4096)
+        native_info = f" (model native limit: {self.model_max_context})" if self.model_max_context else ""
+        print(f"Context window: {self.max_context} tokens{native_info}")
 
         # Load cache index
         with open(os.path.join(cache_dir, "index.json")) as f:
@@ -187,11 +212,11 @@ class NWSEngine:
         attn_mb = sum(sum(w.nbytes for w in l.values()) for l in self.attn_weights) / 1024**2
         print(f" {time.perf_counter()-t0:.1f}s ({attn_mb:.0f} MB)")
 
-        # RoPE cache
-        self.rope_cos, self.rope_sin = build_rope_cache(4096)
+        # RoPE cache — sized to actual context window.
+        self.rope_cos, self.rope_sin = build_rope_cache(self.max_context)
 
-        # KV cache
-        self.kv_max = 4096
+        # KV cache — [n_kv_heads, max_context, head_dim] per layer.
+        self.kv_max = self.max_context
         self.kv_len = 0
         self.kv_k = [np.zeros((N_KV_HEADS, self.kv_max, HEAD_DIM), dtype=np.float32)
                       for _ in range(N_LAYERS)]
